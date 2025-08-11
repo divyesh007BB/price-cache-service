@@ -4,19 +4,15 @@ const { v4: uuidv4 } = require("uuid");
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY // must be service role for RLS bypass
+  process.env.SUPABASE_SERVICE_KEY // service role key (keep in env, not in repo)
 );
 
-let wsBroadcast = () => {}; // default no-op
-
-// Cache so we don't spam DB every tick
+let wsBroadcast = () => {};
 let accounts = new Map();
 let pendingOrders = [];
 let openTrades = [];
 
-/**
- * Called at server startup — loads accounts, pending orders, and open trades
- */
+// 📦 Load accounts, orders, and trades at startup
 async function loadInitialData() {
   console.log("📦 Loading initial data from Supabase...");
 
@@ -45,21 +41,13 @@ async function loadInitialData() {
   );
 }
 
-/**
- * Sets the broadcast function so we can send messages to clients
- */
 function setBroadcaster(broadcastFn) {
   wsBroadcast = broadcastFn;
 }
 
-/**
- * Called on every price tick
- */
+// 📡 Called on every price tick
 async function processTick(symbol, price) {
-  // ✅ Only process BTCUSD in dev until production
-  if (symbol !== "BTCUSD") return;
-
-  // Fill matching pending orders
+  // Fill pending orders
   const toFill = pendingOrders.filter(
     (o) =>
       o.symbol === symbol &&
@@ -143,12 +131,41 @@ async function closeTrade(trade, closePrice) {
       .update({ current_balance: acc.current_balance })
       .eq("id", acc.id);
 
+    // 🔹 Call Risk Engine remotely
+    await runRiskEngine(closedTrade, acc);
+
     wsBroadcast({ type: "account_update", account: acc });
   }
 
   openTrades = openTrades.filter((t) => t.id !== trade.id);
 
   wsBroadcast({ type: "trade_close", trade: closedTrade });
+}
+
+// 🌐 Call the Supabase Edge Function for Risk Engine
+async function runRiskEngine(trade, account) {
+  try {
+    const res = await fetch(
+      `${process.env.SUPABASE_URL}/functions/v1/riskEngine`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.SUPABASE_SERVICE_KEY}`,
+        },
+        body: JSON.stringify({ trade, account }),
+      }
+    );
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error(`❌ Risk Engine failed: ${res.status} ${errText}`);
+    } else {
+      console.log(`📊 Risk Engine executed for account ${account.id}`);
+    }
+  } catch (err) {
+    console.error("❌ Error calling riskEngine:", err);
+  }
 }
 
 module.exports = {

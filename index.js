@@ -6,6 +6,7 @@ const fetch = require("node-fetch");
 const url = require("url");
 
 const { loadInitialData, processTick, setBroadcaster } = require("./matchingEngine");
+const { updateAccountRiskOnTradeClose } = require("./riskEngine");
 
 const app = express();
 app.use(cors());
@@ -15,25 +16,17 @@ const PORT = process.env.PORT || 4000;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const DEV_MODE = process.env.NODE_ENV !== "production";
 
-const WHITELIST = new Set(["BTCUSD"]);
-const FEED_MAP = { BTCUSD: "BINANCE:BTCUSDT" };
+// ✅ Supported symbols
+const WHITELIST = new Set(["BTCUSD", "NIFTY", "BANKNIFTY"]);
+const FEED_MAP = {
+  BTCUSD: "BINANCE:BTCUSDT"
+};
 
-function normalizeToCanonical(sym) {
-  if (!sym) return null;
-  const u = String(sym).trim().toUpperCase();
-  if (WHITELIST.has(u)) return u;
-  switch (u) {
-    case "BINANCE:BTCUSDT":
-    case "BTCUSDT":
-      return "BTCUSD";
-    default:
-      return null;
-  }
-}
-
+// ✅ Price cache
 const priceCache = new Map();
-["BTCUSD"].forEach((s) => priceCache.set(s, { price: 0, ts: Date.now() }));
+WHITELIST.forEach((s) => priceCache.set(s, { price: 0, ts: Date.now() }));
 
+// ✅ Start server
 const server = app.listen(PORT, async () => {
   console.log(`🚀 Price server running on port ${PORT}`);
   try {
@@ -43,14 +36,11 @@ const server = app.listen(PORT, async () => {
   }
 });
 
+// ✅ WebSocket
 const wss = new WebSocket.Server({ noServer: true });
-
-// ✅ Handle WS upgrade
 server.on("upgrade", (req, socket, head) => {
   const { query } = url.parse(req.url, true);
   const token = query.token;
-
-  // Dev mode → no token check
   if (DEV_MODE || token) {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit("connection", ws, req);
@@ -60,39 +50,17 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-function heartbeat() {
-  this.isAlive = true;
-}
-
+function heartbeat() { this.isAlive = true; }
 wss.on("connection", (ws) => {
   ws.isAlive = true;
   ws.on("pong", heartbeat);
-
   console.log("🔌 WS client connected");
   ws.send(JSON.stringify({ type: "welcome", symbols: Array.from(WHITELIST) }));
-
-  ws.on("message", (msg) => {
-    try {
-      const parsed = JSON.parse(msg);
-      if (parsed.type === "subscribe" && parsed.symbol) {
-        console.log(`📡 Client subscribed to ${parsed.symbol}`);
-      }
-    } catch (err) {
-      console.error("❌ WS parse error:", err.message);
-    }
-  });
-
-  ws.on("close", () => console.log("⚠️ WS client disconnected"));
-  ws.on("error", (err) => console.error("❌ WS client error:", err.message));
 });
 
-// ✅ Ping clients to keep alive
 setInterval(() => {
   wss.clients.forEach((ws) => {
-    if (!ws.isAlive) {
-      console.log("⏹ Terminating dead WS");
-      return ws.terminate();
-    }
+    if (!ws.isAlive) return ws.terminate();
     ws.isAlive = false;
     ws.ping();
   });
@@ -112,17 +80,17 @@ function broadcast(msg) {
 }
 setBroadcaster(broadcast);
 
-// REST endpoints
+// ✅ REST endpoints
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.get("/latest-price/:symbol", (req, res) => {
-  const canonical = normalizeToCanonical(req.params.symbol);
-  if (!canonical || !WHITELIST.has(canonical)) {
+  const symbol = req.params.symbol.toUpperCase();
+  if (!WHITELIST.has(symbol)) {
     return res.status(400).json({ error: "Symbol not supported" });
   }
-  const row = priceCache.get(canonical);
+  const row = priceCache.get(symbol);
   if (!row) return res.status(404).json({ error: "No price yet" });
-  res.json({ symbol: canonical, price: row.price, ts: row.ts });
+  res.json({ symbol, price: row.price, ts: row.ts });
 });
 
 app.get("/prices", (_req, res) => {
@@ -131,22 +99,35 @@ app.get("/prices", (_req, res) => {
   res.json(out);
 });
 
-// Price polling
+// ✅ Price polling (BTC from Finnhub, NIFTY & BANKNIFTY from Yahoo)
 async function fetchPrice(symbol) {
-  const vendorSymbol = FEED_MAP[symbol];
-  if (!vendorSymbol) return;
+  const ts = Date.now();
+  let price = null;
+
   try {
-    const url = `https://finnhub.io/api/v1/quote?symbol=${vendorSymbol}&token=${FINNHUB_API_KEY}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
+    if (symbol === "NIFTY") {
+      const res = await fetch("https://query1.finance.yahoo.com/v8/finance/chart/^NSEI?interval=1m");
+      if (!res.ok) throw new Error(`Yahoo HTTP ${res.status}`);
+      const data = await res.json();
+      price = data?.chart?.result?.[0]?.meta?.regularMarketPrice ?? null;
+    } else if (symbol === "BANKNIFTY") {
+      const res = await fetch("https://query1.finance.yahoo.com/v8/finance/chart/^NSEBANK?interval=1m");
+      if (!res.ok) throw new Error(`Yahoo HTTP ${res.status}`);
+      const data = await res.json();
+      price = data?.chart?.result?.[0]?.meta?.regularMarketPrice ?? null;
+    } else if (symbol === "BTCUSD") {
+      const vendorSymbol = FEED_MAP[symbol];
+      const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${vendorSymbol}&token=${FINNHUB_API_KEY}`);
+      if (!res.ok) throw new Error(`Finnhub HTTP ${res.status}`);
+      const data = await res.json();
+      if (typeof data.c === "number" && data.c > 0) {
+        price = data.c;
+      }
+    }
 
-    if (data && typeof data.c === "number" && data.c > 0) {
-      const price = data.c;
-      const ts = Date.now();
+    if (price && price > 0) {
       priceCache.set(symbol, { price, ts });
-
-      processTick(symbol, price);
+      await processTick(symbol, price);
       broadcast({ type: "price", symbol, price, ts });
       console.log(`💹 ${symbol}: ${price}`);
     }
@@ -155,10 +136,27 @@ async function fetchPrice(symbol) {
   }
 }
 
+// ✅ Poll every 5 seconds
 function startPolling() {
-  setInterval(() => fetchPrice("BTCUSD"), 5000);
+  WHITELIST.forEach(sym => {
+    setInterval(() => fetchPrice(sym), 5000);
+  });
 }
 startPolling();
+
+// ✅ Risk Engine
+async function handleTradeClose(trade, account) {
+  await updateAccountRiskOnTradeClose(trade, account);
+  broadcast({ type: "trade_closed", trade });
+}
+
+setBroadcaster((msg) => {
+  if (msg.type === "trade_closed") {
+    handleTradeClose(msg.trade, msg.account);
+  } else {
+    broadcast(msg);
+  }
+});
 
 process.on("unhandledRejection", (err) => console.error("🧯 UnhandledRejection:", err));
 process.on("uncaughtException", (err) => console.error("🧯 UncaughtException:", err));
