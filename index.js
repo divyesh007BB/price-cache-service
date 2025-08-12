@@ -46,10 +46,11 @@ const server = app.listen(PORT, async () => {
 
 // ✅ WebSocket setup
 const wss = new WebSocket.Server({ noServer: true });
+
+// Explicitly handle `/ws` path
 server.on("upgrade", (req, socket, head) => {
-  const { query } = url.parse(req.url, true);
-  const token = query.token;
-  if (DEV_MODE || token) {
+  const pathname = url.parse(req.url).pathname;
+  if (pathname === "/ws") {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit("connection", ws, req);
     });
