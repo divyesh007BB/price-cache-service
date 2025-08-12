@@ -4,6 +4,7 @@ const WebSocket = require("ws");
 const cors = require("cors");
 const fetch = require("node-fetch");
 const url = require("url");
+const { createClient } = require("@supabase/supabase-js");
 
 const {
   loadInitialData,
@@ -24,9 +25,13 @@ const PORT = process.env.PORT || 4000;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const DEV_MODE = process.env.NODE_ENV !== "production";
 
-// ✅ Supabase credentials for token validation
+// ✅ Supabase credentials
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+// ✅ Supabase Admin client for JWT validation
+const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ✅ Supported symbols
 const WHITELIST = new Set(["BTCUSD", "NIFTY", "BANKNIFTY"]);
@@ -71,18 +76,13 @@ server.on("upgrade", async (req, socket, head) => {
     // ✅ Validate Supabase JWT if present
     if (token && !DEV_MODE) {
       try {
-        const resp = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            apikey: SUPABASE_ANON_KEY
-          }
-        });
-
-        if (!resp.ok) {
+        const { data, error } = await supabaseAdmin.auth.getUser(token);
+        if (error || !data?.user) {
           console.warn("❌ Invalid token, closing WS");
           socket.destroy();
           return;
         }
+        console.log(`✅ Authenticated user: ${data.user.id}`);
       } catch (err) {
         console.error("❌ Token validation error:", err.message);
         socket.destroy();

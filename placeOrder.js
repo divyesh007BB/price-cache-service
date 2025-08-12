@@ -1,14 +1,15 @@
-// placeOrder.js
 const express = require("express");
 const router = express.Router();
-const { placeOrder } = require("./matchingEngine"); // ✅ same folder
-const { broadcast } = require("./websocketServer"); // ✅ ensure websocketServer.js exists and exports broadcast
+const { placeOrder } = require("./matchingEngine");
+const { broadcast } = require("./websocketServer");
 const { v4: uuidv4 } = require("uuid");
 
-/**
- * POST /place-order
- * Handles incoming order requests from Supabase Edge Function executeOrder
- */
+// ✅ Import from backend symbolMap
+const { normalizeSymbol, CONTRACTS } = require("./symbolMap");
+
+// Build whitelist directly from CONTRACTS keys
+const WHITELIST = new Set(Object.keys(CONTRACTS));
+
 router.post("/place-order", async (req, res) => {
   try {
     const {
@@ -25,42 +26,40 @@ router.post("/place-order", async (req, res) => {
     } = req.body;
 
     // ✅ Basic validation
-    if (!user_id) {
-      return res.status(400).json({ status: "error", error: "Missing user_id" });
-    }
-    if (!account_id) {
-      return res.status(400).json({ status: "error", error: "Missing account_id" });
-    }
-    if (!symbol) {
-      return res.status(400).json({ status: "error", error: "Missing symbol" });
-    }
-    if (!["buy", "sell"].includes(side)) {
-      return res.status(400).json({ status: "error", error: "Invalid side" });
-    }
-    if (!["market", "limit"].includes(order_type)) {
-      return res.status(400).json({ status: "error", error: "Invalid order_type" });
+    if (!user_id) return res.status(400).json({ status: "error", error: "Missing user_id" });
+    if (!account_id) return res.status(400).json({ status: "error", error: "Missing account_id" });
+    if (!symbol) return res.status(400).json({ status: "error", error: "Missing symbol" });
+    if (!["buy", "sell"].includes(side)) return res.status(400).json({ status: "error", error: "Invalid side" });
+    if (!["market", "limit"].includes(order_type)) return res.status(400).json({ status: "error", error: "Invalid order_type" });
+
+    // ✅ Normalize using shared function
+    const normSymbol = normalizeSymbol(symbol);
+
+    // ✅ Whitelist check
+    if (!WHITELIST.has(normSymbol)) {
+      return res.status(400).json({ status: "error", error: `Symbol not supported: ${symbol}` });
     }
 
-    // ✅ Build order object for matchingEngine
+    // ✅ Build order object
     const order = {
       id: uuidv4(),
       user_id,
       account_id,
-      symbol: symbol.toUpperCase(),
+      symbol: normSymbol,
       side: side.toLowerCase(),
       size: Number(quantity),
       type: order_type.toLowerCase(),
-      sl: stop_loss ?? null,
-      tp: take_profit ?? null,
-      price: limit_price ?? null,
+      sl: stop_loss ? Number(stop_loss) : null,
+      tp: take_profit ? Number(take_profit) : null,
+      price: limit_price ? Number(limit_price) : null,
       created_at: new Date().toISOString(),
-      idempotency_key: idempotency_key ?? null
+      idempotency_key: idempotency_key || null
     };
 
-    // ✅ Call your core matching engine logic
+    // ✅ Send to matching engine
     await placeOrder(order);
 
-    // 📡 Broadcast to all WS clients that a new order was placed
+    // 📡 Broadcast update for UI
     broadcast({
       type: "order_update",
       data: {
