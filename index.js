@@ -5,12 +5,20 @@ const cors = require("cors");
 const fetch = require("node-fetch");
 const url = require("url");
 
-const { loadInitialData, processTick, setBroadcaster } = require("./matchingEngine");
-const { updateAccountRiskOnTradeClose } = require("./riskEngine");
+const {
+  loadInitialData,
+  processTick,
+  setBroadcaster
+} = require("./matchingEngine");
+const { evaluateOpenPositions } = require("./riskEngine"); // ✅ SL/TP logic
+const placeOrderRoute = require("./placeOrder"); // ✅ Our new route
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// ✅ Routes
+app.use("/", placeOrderRoute); // <-- Now /place-order works
 
 const PORT = process.env.PORT || 4000;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
@@ -36,7 +44,7 @@ const server = app.listen(PORT, async () => {
   }
 });
 
-// ✅ WebSocket
+// ✅ WebSocket setup
 const wss = new WebSocket.Server({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
   const { query } = url.parse(req.url, true);
@@ -99,7 +107,7 @@ app.get("/prices", (_req, res) => {
   res.json(out);
 });
 
-// ✅ Price polling (BTC from Finnhub, NIFTY & BANKNIFTY from Yahoo)
+// ✅ Price fetching
 async function fetchPrice(symbol) {
   const ts = Date.now();
   let price = null;
@@ -127,7 +135,14 @@ async function fetchPrice(symbol) {
 
     if (price && price > 0) {
       priceCache.set(symbol, { price, ts });
+
+      // 1️⃣ Process pending orders
       await processTick(symbol, price);
+
+      // 2️⃣ Check SL/TP
+      await evaluateOpenPositions(symbol, price);
+
+      // 3️⃣ Broadcast
       broadcast({ type: "price", symbol, price, ts });
       console.log(`💹 ${symbol}: ${price}`);
     }
@@ -143,20 +158,6 @@ function startPolling() {
   });
 }
 startPolling();
-
-// ✅ Risk Engine
-async function handleTradeClose(trade, account) {
-  await updateAccountRiskOnTradeClose(trade, account);
-  broadcast({ type: "trade_closed", trade });
-}
-
-setBroadcaster((msg) => {
-  if (msg.type === "trade_closed") {
-    handleTradeClose(msg.trade, msg.account);
-  } else {
-    broadcast(msg);
-  }
-});
 
 process.on("unhandledRejection", (err) => console.error("🧯 UnhandledRejection:", err));
 process.on("uncaughtException", (err) => console.error("🧯 UncaughtException:", err));
