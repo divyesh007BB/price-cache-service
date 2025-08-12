@@ -4,7 +4,7 @@ const WebSocket = require("ws");
 const cors = require("cors");
 const fetch = require("node-fetch");
 const url = require("url");
-const { createClient } = require("@supabase/supabase-js");
+const { supabaseAdmin } = require("./config"); // ✅ centralized config
 
 const {
   loadInitialData,
@@ -24,14 +24,6 @@ app.use("/", placeOrderRoute);
 const PORT = process.env.PORT || 4000;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const DEV_MODE = process.env.NODE_ENV !== "production";
-
-// ✅ Supabase credentials
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-// ✅ Supabase Admin client for JWT validation
-const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ✅ Supported symbols
 const WHITELIST = new Set(["BTCUSD", "NIFTY", "BANKNIFTY"]);
@@ -66,14 +58,12 @@ server.on("upgrade", async (req, socket, head) => {
   const token = query?.token;
 
   if (pathname === "/ws") {
-    // ✅ Require token in production
     if (!token && !DEV_MODE) {
       console.warn("❌ No token provided, closing connection");
       socket.destroy();
       return;
     }
 
-    // ✅ Validate Supabase JWT if present
     if (token && !DEV_MODE) {
       try {
         const { data, error } = await supabaseAdmin.auth.getUser(token);
@@ -90,7 +80,6 @@ server.on("upgrade", async (req, socket, head) => {
       }
     }
 
-    // ✅ If token valid, accept WS
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit("connection", ws, req);
     });
@@ -176,14 +165,8 @@ async function fetchPrice(symbol) {
 
     if (price && price > 0) {
       priceCache.set(symbol, { price, ts });
-
-      // 1️⃣ Process pending orders
       await processTick(symbol, price);
-
-      // 2️⃣ Check SL/TP
       await evaluateOpenPositions(symbol, price);
-
-      // 3️⃣ Broadcast
       broadcast({ type: "price", symbol, price, ts });
       console.log(`💹 ${symbol}: ${price}`);
     }
@@ -192,7 +175,6 @@ async function fetchPrice(symbol) {
   }
 }
 
-// ✅ Poll every 5 seconds
 function startPolling() {
   WHITELIST.forEach(sym => {
     setInterval(() => fetchPrice(sym), 5000);
