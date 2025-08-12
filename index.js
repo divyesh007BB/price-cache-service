@@ -10,19 +10,23 @@ const {
   processTick,
   setBroadcaster
 } = require("./matchingEngine");
-const { evaluateOpenPositions } = require("./riskEngine"); // ✅ SL/TP logic
-const placeOrderRoute = require("./placeOrder"); // ✅ Our new route
+const { evaluateOpenPositions } = require("./riskEngine");
+const placeOrderRoute = require("./placeOrder");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 // ✅ Routes
-app.use("/", placeOrderRoute); // <-- Now /place-order works
+app.use("/", placeOrderRoute);
 
 const PORT = process.env.PORT || 4000;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const DEV_MODE = process.env.NODE_ENV !== "production";
+
+// ✅ Supabase credentials for token validation
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
 // ✅ Supported symbols
 const WHITELIST = new Set(["BTCUSD", "NIFTY", "BANKNIFTY"]);
@@ -47,10 +51,46 @@ const server = app.listen(PORT, async () => {
 // ✅ WebSocket setup
 const wss = new WebSocket.Server({ noServer: true });
 
-// Explicitly handle `/ws` path
-server.on("upgrade", (req, socket, head) => {
+// WS heartbeat
+function heartbeat() { this.isAlive = true; }
+
+// ✅ Handle `/ws` path with JWT validation
+server.on("upgrade", async (req, socket, head) => {
   const pathname = url.parse(req.url).pathname;
+  const query = url.parse(req.url, true).query;
+  const token = query?.token;
+
   if (pathname === "/ws") {
+    // ✅ Require token in production
+    if (!token && !DEV_MODE) {
+      console.warn("❌ No token provided, closing connection");
+      socket.destroy();
+      return;
+    }
+
+    // ✅ Validate Supabase JWT if present
+    if (token && !DEV_MODE) {
+      try {
+        const resp = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            apikey: SUPABASE_ANON_KEY
+          }
+        });
+
+        if (!resp.ok) {
+          console.warn("❌ Invalid token, closing WS");
+          socket.destroy();
+          return;
+        }
+      } catch (err) {
+        console.error("❌ Token validation error:", err.message);
+        socket.destroy();
+        return;
+      }
+    }
+
+    // ✅ If token valid, accept WS
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit("connection", ws, req);
     });
@@ -59,7 +99,6 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-function heartbeat() { this.isAlive = true; }
 wss.on("connection", (ws) => {
   ws.isAlive = true;
   ws.on("pong", heartbeat);
@@ -75,6 +114,7 @@ setInterval(() => {
   });
 }, 25000);
 
+// ✅ Broadcast helper
 function broadcast(msg) {
   try {
     const data = JSON.stringify(msg);
