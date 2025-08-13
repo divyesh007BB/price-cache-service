@@ -13,7 +13,10 @@ const {
 } = require("./matchingEngine");
 const { evaluateOpenPositions } = require("./riskEngine");
 const placeOrderRoute = require("./placeOrder");
-const { loadContractsFromDB, getContracts, normalizeSymbol } = require("./symbolMap");
+const { loadContractsFromDB, getContracts } = require("./symbolMap");
+
+// ✅ Shared state
+const { priceCache, WHITELIST } = require("./state");
 
 const app = express();
 app.use(cors());
@@ -26,11 +29,10 @@ const PORT = process.env.PORT || 4000;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const DEV_MODE = process.env.NODE_ENV !== "production";
 
-// ✅ Dynamic symbol sets
-let WHITELIST = new Set();
+// ✅ Feed map for fetching vendor prices
 let FEED_MAP = {};
 
-// ✅ Load symbols from DB
+// ✅ Load symbols from DB and populate shared state
 async function refreshInstruments() {
   await loadContractsFromDB();
   const CONTRACTS = getContracts();
@@ -38,21 +40,15 @@ async function refreshInstruments() {
     console.warn("❌ No contracts loaded from DB");
     return;
   }
-  WHITELIST = new Set(Object.keys(CONTRACTS));
+  WHITELIST.clear();
+  Object.keys(CONTRACTS).forEach(code => WHITELIST.add(code));
   FEED_MAP = {};
   for (const [code, meta] of Object.entries(CONTRACTS)) {
     FEED_MAP[code] = meta.priceKey;
     FEED_MAP[meta.priceKey] = meta.priceKey;
   }
-  console.log("✅ Instruments loaded into price server:", WHITELIST);
+  console.log("✅ Instruments loaded into price server:", Array.from(WHITELIST));
 }
-
-// ✅ Price cache
-const priceCache = new Map();
-function initPriceCache() {
-  WHITELIST.forEach((s) => priceCache.set(s, { price: 0, ts: Date.now() }));
-}
-initPriceCache();
 
 // ✅ WebSocket setup
 const wss = new WebSocket.Server({ noServer: true });
@@ -77,14 +73,12 @@ const server = app.listen(PORT, async () => {
   try {
     await loadInitialData();
     await refreshInstruments();
-    initPriceCache();
     startPolling();
 
     // ♻️ Auto-refresh instruments every 10 minutes
     setInterval(async () => {
       console.log("🔄 Refreshing instruments from DB...");
       await refreshInstruments();
-      initPriceCache();
     }, 10 * 60 * 1000);
     
   } catch (err) {

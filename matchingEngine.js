@@ -2,11 +2,8 @@ require("dotenv").config();
 const { createClient } = require("@supabase/supabase-js");
 const { v4: uuidv4 } = require("uuid");
 const { normalizeSymbol, CONTRACTS } = require("./symbolMap");
-
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
+const { priceCache } = require("./state"); // ✅ Shared state
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 let wsBroadcast = () => {};
 let accounts = new Map();
@@ -17,7 +14,6 @@ let openTrades = [];
 const EXECUTION_LATENCY_MS = 150;
 const ENABLE_PARTIAL_FILLS = false;
 const PARTIAL_FILL_RATIO = 0.5;
-
 // ======================
 
 // 📦 Load accounts, orders, and trades
@@ -26,7 +22,7 @@ async function loadInitialData() {
 
   const { data: accData, error: accErr } = await supabase.from("accounts").select("*");
   if (accErr) throw accErr;
-  accData.forEach((acc) => accounts.set(acc.id, acc));
+  accData.forEach(acc => accounts.set(acc.id, acc));
 
   const { data: poData, error: poErr } = await supabase.from("orders").select("*").eq("status", "pending");
   if (poErr) throw poErr;
@@ -55,11 +51,10 @@ async function processTick(symbol, price) {
   const normSymbol = normalizeSymbol(symbol);
 
   // Fill eligible limit orders
-  const toFill = pendingOrders.filter(
-    (o) =>
-      o.symbol === normSymbol &&
-      ((o.side === "buy" && price <= o.price) ||
-        (o.side === "sell" && price >= o.price))
+  const toFill = pendingOrders.filter(o =>
+    o.symbol === normSymbol &&
+    ((o.side === "buy" && price <= o.price) ||
+     (o.side === "sell" && price >= o.price))
   );
 
   for (const order of toFill) {
@@ -67,7 +62,7 @@ async function processTick(symbol, price) {
   }
 
   // Check SL/TP for open trades
-  const toClose = openTrades.filter((t) => {
+  const toClose = openTrades.filter(t => {
     if (t.symbol !== normSymbol) return false;
     if (t.side === "buy") {
       if (t.sl && price <= t.sl) return true;
@@ -101,7 +96,7 @@ async function placeOrder(order) {
     return;
   }
 
-  // 2️⃣ Check max lot size based on account type
+  // 2️⃣ Check max lot size
   if (account && contract.maxLots?.[account.account_type]) {
     const maxAllowed = contract.maxLots[account.account_type];
     if (order.size > maxAllowed) {
@@ -111,12 +106,13 @@ async function placeOrder(order) {
   }
 
   if (order.type === "market") {
-    const latestPrice = await getLatestPrice(order.symbol);
-    if (!latestPrice) {
-      console.error(`❌ No price for ${order.symbol}`);
+    // ✅ Fill instantly from live priceCache
+    const cached = priceCache.get(order.symbol);
+    if (!cached || !cached.price) {
+      console.error(`❌ No live price in cache for ${order.symbol}`);
       return;
     }
-    await fillOrder(order, latestPrice);
+    await fillOrder(order, cached.price);
   } else {
     const { error } = await supabase.from("orders").insert(order);
     if (error) console.error("❌ Error saving order:", error.message);
@@ -134,11 +130,8 @@ async function fillOrder(order, basePrice) {
     const spread = contract?.spread || 0;
     const commission = contract?.commission || 0;
 
-    // Apply spread
-    const execPrice =
-      order.side === "buy" ? basePrice + spread : basePrice - spread;
+    const execPrice = order.side === "buy" ? basePrice + spread : basePrice - spread;
 
-    // Apply partial fill if enabled
     let sizeToFill = order.size;
     if (ENABLE_PARTIAL_FILLS) {
       sizeToFill = Math.ceil(order.size * PARTIAL_FILL_RATIO);
@@ -157,13 +150,13 @@ async function fillOrder(order, basePrice) {
       tp: order.tp,
       status: "open",
       opened_at: new Date().toISOString(),
-      pnl: -commission * sizeToFill // upfront commission
+      pnl: -commission * sizeToFill
     };
 
     await supabase.from("orders").update({ status: "filled" }).eq("id", order.id);
     await supabase.from("trades").insert(trade);
 
-    pendingOrders = pendingOrders.filter((o) => o.id !== order.id);
+    pendingOrders = pendingOrders.filter(o => o.id !== order.id);
     openTrades.push(trade);
 
     wsBroadcast({ type: "trade_fill", trade });
@@ -172,12 +165,11 @@ async function fillOrder(order, basePrice) {
 
 // 📉 Close trade with MIL enforcement
 async function closeTrade(trade, closePrice) {
-  const pnl =
-    trade.side === "buy"
-      ? (closePrice - trade.entry) * trade.size
-      : (trade.entry - closePrice) * trade.size;
+  const pnl = trade.side === "buy"
+    ? (closePrice - trade.entry) * trade.size
+    : (trade.entry - closePrice) * trade.size;
 
-  const netPnL = pnl + trade.pnl; // commission already deducted
+  const netPnL = pnl + trade.pnl;
 
   const closedTrade = {
     ...trade,
@@ -228,7 +220,7 @@ async function closeTrade(trade, closePrice) {
     wsBroadcast({ type: "account_update", account: acc });
   }
 
-  openTrades = openTrades.filter((t) => t.id !== trade.id);
+  openTrades = openTrades.filter(t => t.id !== trade.id);
   wsBroadcast({ type: "trade_close", trade: closedTrade });
 }
 
@@ -256,21 +248,6 @@ async function runRiskEngine(trade, account) {
   } catch (err) {
     console.error("❌ Error calling riskEngine:", err);
   }
-}
-
-// 📈 Latest price
-async function getLatestPrice(symbol) {
-  const normSymbol = normalizeSymbol(symbol);
-  const { data, error } = await supabase
-    .from("latest_prices")
-    .select("price")
-    .eq("symbol", normSymbol)
-    .maybeSingle();
-  if (error) {
-    console.error(`❌ getLatestPrice error: ${error.message}`);
-    return null;
-  }
-  return data?.price ?? null;
 }
 
 // 📅 Check trading hours
