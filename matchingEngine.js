@@ -1,4 +1,4 @@
-// matchingEngine.js — Real prop firm style execution
+// matchingEngine.js — Real prop firm style execution (patched)
 
 require("dotenv").config();
 const { createClient } = require("@supabase/supabase-js");
@@ -17,9 +17,10 @@ let openTrades = [];
 const EXECUTION_LATENCY_MS = 150;
 const ENABLE_PARTIAL_FILLS = false;
 const PARTIAL_FILL_RATIO = 0.5;
+const SLTP_GRACE_MS = 1000; // ✅ Grace period for SL/TP after fill
 // ====================
 
-// 📦 Load initial state
+// 📦 Load initial state from DB
 async function loadInitialData() {
   console.log("📦 Loading initial data from Supabase...");
   await loadContractsFromDB();
@@ -38,6 +39,14 @@ async function loadInitialData() {
 
   console.log(`✅ Loaded ${accounts.size} accounts, ${pendingOrders.length} pending orders, ${openTrades.length} open trades`);
 
+  broadcastSnapshot();
+}
+
+function setBroadcaster(broadcastFn) {
+  wsBroadcast = broadcastFn;
+}
+
+function broadcastSnapshot() {
   wsBroadcast({
     type: "sync_state",
     accounts: Array.from(accounts.values()),
@@ -46,11 +55,7 @@ async function loadInitialData() {
   });
 }
 
-function setBroadcaster(broadcastFn) {
-  wsBroadcast = broadcastFn;
-}
-
-// 📡 On each tick
+// 📡 Price tick handler
 async function processTick(symbol, price) {
   const normSymbol = normalizeSymbol(symbol);
 
@@ -67,15 +72,18 @@ async function processTick(symbol, price) {
   // SL/TP checks
   const toClose = openTrades.filter(t => {
     if (t.symbol !== normSymbol) return false;
+    if (Date.now() - new Date(t.time_opened).getTime() < SLTP_GRACE_MS) return false;
+
     if (t.side === "buy") {
-      if (t.stop_loss && price <= t.stop_loss) return true;
-      if (t.take_profit && price >= t.take_profit) return true;
+      if (t.stop_loss != null && price <= t.stop_loss) return true;
+      if (t.take_profit != null && price >= t.take_profit) return true;
     } else {
-      if (t.stop_loss && price >= t.stop_loss) return true;
-      if (t.take_profit && price <= t.take_profit) return true;
+      if (t.stop_loss != null && price >= t.stop_loss) return true;
+      if (t.take_profit != null && price <= t.take_profit) return true;
     }
     return false;
   });
+
   for (const trade of toClose) {
     await closeTrade(trade, price);
   }
@@ -84,38 +92,27 @@ async function processTick(symbol, price) {
 // 📥 Place new order
 async function placeOrder(order) {
   order.symbol = normalizeSymbol(order.symbol);
-
   const account = accounts.get(order.account_id);
   const contract = getContracts()[order.symbol];
-  if (!contract) {
-    console.warn(`❌ Symbol not supported: ${order.symbol}`);
-    return;
-  }
+  if (!contract) return console.warn(`❌ Symbol not supported: ${order.symbol}`);
 
-  if (!withinTradingHours(order.symbol)) {
-    console.warn(`❌ Market closed for ${order.symbol}`);
-    return;
-  }
+  if (!withinTradingHours(order.symbol)) return console.warn(`❌ Market closed for ${order.symbol}`);
 
   if (account && contract.maxLots?.[account.account_type]) {
     const maxAllowed = contract.maxLots[account.account_type];
     if (order.size > maxAllowed) {
-      console.warn(`❌ Order exceeds max lots for ${order.symbol} (${order.size} > ${maxAllowed})`);
-      return;
+      return console.warn(`❌ Order exceeds max lots for ${order.symbol} (${order.size} > ${maxAllowed})`);
     }
   }
 
   if (order.type === "market") {
     const cached = priceCache.get(order.symbol);
-    if (!cached || !cached.price) {
-      console.error(`❌ No live price in cache for ${order.symbol}`);
-      return;
-    }
+    if (!cached?.price) return console.error(`❌ No live price in cache for ${order.symbol}`);
     const execPrice = convertPrice(order.symbol, cached.price);
-
-    // Save order row
     const orderId = order.id || uuidv4();
-    await supabase.from("orders").insert({
+
+    // DB write is async — we fill immediately
+    supabase.from("orders").insert({
       id: orderId,
       account_id: order.account_id,
       user_id: order.user_id,
@@ -125,12 +122,16 @@ async function placeOrder(order) {
       order_type: "market",
       status: "new",
       created_at: new Date().toISOString()
-    });
+    }).catch(err => console.error("Order insert error:", err));
 
     await fillOrder({ ...order, id: orderId }, execPrice);
   } else {
     const orderId = order.id || uuidv4();
-    const { error } = await supabase.from("orders").insert({
+    pendingOrders.push({ ...order, id: orderId });
+    wsBroadcast({ type: "order_pending", order: { ...order, id: orderId } });
+    broadcastSnapshot();
+
+    supabase.from("orders").insert({
       id: orderId,
       account_id: order.account_id,
       user_id: order.user_id,
@@ -139,33 +140,22 @@ async function placeOrder(order) {
       quantity: order.size,
       order_type: "limit",
       limit_price: order.limit_price,
-      stop_loss: order.sl,
-      take_profit: order.tp,
+      stop_loss: order.sl ?? null,
+      take_profit: order.tp ?? null,
       status: "pending",
       created_at: new Date().toISOString(),
-    });
-    if (error) console.error("❌ Error saving limit order:", error.message);
-    else {
-      pendingOrders.push({ ...order, id: orderId });
-      wsBroadcast({ type: "order_pending", order: { ...order, id: orderId } });
-    }
+    }).catch(err => console.error("Limit order insert error:", err));
   }
 }
 
 // 📊 Fill order into a trade
 async function fillOrder(order, basePrice) {
-  setTimeout(async () => {
+  setTimeout(() => {
     const contract = getContracts()[order.symbol];
     const spread = contract?.spread || 0;
     const commission = contract?.commission || 0;
-
     const execPrice = order.side === "buy" ? basePrice + spread : basePrice - spread;
-
-    let sizeToFill = order.size;
-    if (ENABLE_PARTIAL_FILLS) {
-      sizeToFill = Math.ceil(order.size * PARTIAL_FILL_RATIO);
-      console.log(`⚠ Partial fill: ${sizeToFill}/${order.size}`);
-    }
+    let sizeToFill = ENABLE_PARTIAL_FILLS ? Math.ceil(order.size * PARTIAL_FILL_RATIO) : order.size;
 
     const trade = {
       id: uuidv4(),
@@ -175,29 +165,31 @@ async function fillOrder(order, basePrice) {
       side: order.side,
       quantity: sizeToFill,
       entry_price: execPrice,
-      stop_loss: order.sl,
-      take_profit: order.tp,
+      stop_loss: order.sl ?? null,
+      take_profit: order.tp ?? null,
       is_open: true,
       status: "open",
       time_opened: new Date().toISOString(),
       pnl: -commission * sizeToFill
     };
 
-    if (order.id) {
-      await supabase.from("orders").update({
-        status: "filled",
-        entry_price: execPrice,
-        filled_at: new Date().toISOString()
-      }).eq("id", order.id);
-    }
-
-    await supabase.from("trades").insert(trade);
-
+    // Memory update first
     pendingOrders = pendingOrders.filter(o => o.id !== order.id);
     openTrades.push(trade);
 
-    // ✅ FIX: Send as `trade`
+    // Broadcast updates
     wsBroadcast({ type: "trade_fill", trade });
+    broadcastSnapshot();
+
+    // Async DB writes
+    if (order.id) {
+      supabase.from("orders").update({
+        status: "filled",
+        entry_price: execPrice,
+        filled_at: new Date().toISOString()
+      }).eq("id", order.id).catch(err => console.error("Order update error:", err));
+    }
+    supabase.from("trades").insert(trade).catch(err => console.error("Trade insert error:", err));
 
     console.log(`✅ Filled order ${order.id} at ${execPrice}`);
   }, EXECUTION_LATENCY_MS);
@@ -209,85 +201,66 @@ async function closeTrade(trade, closePrice) {
   const pnl = trade.side === "buy"
     ? (closePrice - trade.entry_price) * trade.quantity * tickValue
     : (trade.entry_price - closePrice) * trade.quantity * tickValue;
-
   const netPnL = pnl + (trade.pnl || 0);
 
-  const closedTrade = {
-    ...trade,
-    is_open: false,
-    status: "closed",
-    time_closed: new Date().toISOString(),
-    exit_price: closePrice,
-    pnl: netPnL
-  };
+  const closedTrade = { ...trade, is_open: false, status: "closed", time_closed: new Date().toISOString(), exit_price: closePrice, pnl: netPnL };
 
-  await supabase.from("trades").update(closedTrade).eq("id", trade.id);
+  // Memory update first
+  openTrades = openTrades.filter(t => t.id !== trade.id);
+
+  // Broadcast updates
+  wsBroadcast({ type: "trade_close", trade: closedTrade });
+  broadcastSnapshot();
+
+  // Async DB update
+  supabase.from("trades").update(closedTrade).eq("id", trade.id).catch(err => console.error("Trade update error:", err));
 
   const acc = accounts.get(trade.account_id);
   if (acc) {
     acc.current_balance += netPnL;
     accounts.set(acc.id, acc);
-    await supabase.from("accounts").update({ current_balance: acc.current_balance }).eq("id", acc.id);
+    wsBroadcast({ type: "account_update", account: acc });
 
-    await runRiskEngine(closedTrade, acc);
+    supabase.from("accounts").update({ current_balance: acc.current_balance }).eq("id", acc.id).catch(err => console.error("Account update error:", err));
+    runRiskEngine(closedTrade, acc);
 
+    // MIL check
     if (acc.max_intraday_loss) {
       const today = new Date().toISOString().split("T")[0];
-      const { data: todayClosed, error } = await supabase
-        .from("trades")
+      supabase.from("trades")
         .select("pnl")
         .eq("account_id", acc.id)
         .eq("status", "closed")
-        .gte("time_closed", today);
-
-      if (!error) {
-        const totalLossToday = todayClosed
-          .filter(t => t.pnl < 0)
-          .reduce((sum, t) => sum + t.pnl, 0);
-
-        if (Math.abs(totalLossToday) >= acc.max_intraday_loss) {
-          console.log(`💀 MIL breached for account ${acc.id} — marking blown`);
-          await supabase.from("accounts").update({ status: "blown" }).eq("id", acc.id);
-
-          for (const pos of openTrades.filter(
-            p => p.account_id === acc.id && p.id !== trade.id
-          )) {
-            await closeTrade(pos, closePrice);
+        .gte("time_closed", today)
+        .then(({ data, error }) => {
+          if (!error) {
+            const totalLossToday = data.filter(t => t.pnl < 0).reduce((sum, t) => sum + t.pnl, 0);
+            if (Math.abs(totalLossToday) >= acc.max_intraday_loss) {
+              console.log(`💀 MIL breached for account ${acc.id} — marking blown`);
+              supabase.from("accounts").update({ status: "blown" }).eq("id", acc.id);
+              for (const pos of openTrades.filter(p => p.account_id === acc.id)) {
+                closeTrade(pos, closePrice);
+              }
+            }
           }
-        }
-      }
+        });
     }
-
-    wsBroadcast({ type: "account_update", account: acc });
   }
-
-  openTrades = openTrades.filter(t => t.id !== trade.id);
-
-  // ✅ FIX: Send as `trade`
-  wsBroadcast({ type: "trade_close", trade: closedTrade });
 }
 
 // 🌐 Risk Engine hook
 async function runRiskEngine(trade, account) {
   try {
-    const res = await fetch(
-      `${process.env.SUPABASE_URL}/functions/v1/riskEngine`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${process.env.SUPABASE_SERVICE_KEY}`,
-        },
-        body: JSON.stringify({ trade, account }),
-      }
-    );
-
-    if (!res.ok) {
-      const errText = await res.text();
-      console.error(`❌ Risk Engine failed: ${res.status} ${errText}`);
-    } else {
-      console.log(`📊 Risk Engine executed for account ${account.id}`);
-    }
+    const res = await fetch(`${process.env.SUPABASE_URL}/functions/v1/riskEngine`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.SUPABASE_SERVICE_KEY}`,
+      },
+      body: JSON.stringify({ trade, account }),
+    });
+    if (!res.ok) console.error(`❌ Risk Engine failed: ${res.status} ${await res.text()}`);
+    else console.log(`📊 Risk Engine executed for account ${account.id}`);
   } catch (err) {
     console.error("❌ Error calling riskEngine:", err);
   }
