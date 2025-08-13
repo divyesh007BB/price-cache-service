@@ -1,7 +1,5 @@
-/**
- * Contract meta info for each tradable instrument.
- */
-const CONTRACTS = {
+// ===== Contract Metadata =====
+export const CONTRACTS = {
   NIFTY: {
     qtyStep: 1,
     minQty: 1,
@@ -10,7 +8,7 @@ const CONTRACTS = {
     tickValue: 50,
     convertToINR: true,
     maxLots: { Evaluation: 20, Funded: 50 },
-    tradingHours: { start: 3.5, end: 10.5 }, // UTC hours
+    tradingHours: { start: 3.5, end: 10.5 },
     dailyLossLimit: 100000,
     commission: 50,
     spread: 0.5,
@@ -28,32 +26,6 @@ const CONTRACTS = {
     commission: 50,
     spread: 1,
   },
-  "OANDA:XAU_USD": {
-    qtyStep: 0.01,
-    minQty: 0.01,
-    priceKey: "OANDA:XAU_USD",
-    display: "Gold",
-    tickValue: 1000,
-    convertToINR: true,
-    maxLots: { Evaluation: 5, Funded: 10 },
-    tradingHours: { start: 0, end: 23 },
-    dailyLossLimit: 200000,
-    commission: 50,
-    spread: 0.3,
-  },
-  "BINANCE:BTCUSDT": {
-    qtyStep: 0.01,
-    minQty: 0.01,
-    priceKey: "BINANCE:BTCUSDT",
-    display: "Bitcoin",
-    tickValue: 2000,
-    convertToINR: false,
-    maxLots: { Evaluation: 2, Funded: 5 },
-    tradingHours: { start: 0, end: 24 },
-    dailyLossLimit: 250000,
-    commission: 50,
-    spread: 5,
-  },
   USDINR: {
     qtyStep: 1,
     minQty: 1,
@@ -67,44 +39,73 @@ const CONTRACTS = {
     commission: 50,
     spread: 0.02,
   },
+  EURUSD: {
+    qtyStep: 1,
+    minQty: 1,
+    priceKey: "FX:EURUSD",
+    display: "EUR/USD",
+    tickValue: 1000,
+    convertToINR: false,
+    maxLots: { Evaluation: 50, Funded: 100 },
+    tradingHours: { start: 0, end: 24 },
+    dailyLossLimit: 100000,
+    commission: 50,
+    spread: 0.0002,
+  },
+  "BINANCE:BTCUSDT": {
+    qtyStep: 0.01,
+    minQty: 0.01,
+    priceKey: "BINANCE:BTCUSDT",
+    display: "Bitcoin (BTC/USD)",
+    tickValue: 2000,
+    convertToINR: false,
+    maxLots: { Evaluation: 2, Funded: 5 },
+    tradingHours: { start: 0, end: 24 },
+    dailyLossLimit: 250000,
+    commission: 50,
+    spread: 5,
+  },
 };
 
-/**
- * Maps external feed symbols & UI aliases → backend contract key
- */
-function normalizeSymbol(symbol) {
+// ===== Symbol Mapping =====
+const FEED_SYMBOL_MAP = {
+  // Exchange feed → Internal key
+  "NSE:NIFTY": "NIFTY",
+  "NSENIFTY": "NIFTY",
+  "NSE:BANKNIFTY": "BANKNIFTY",
+  "NSEBANKNIFTY": "BANKNIFTY",
+  "FX:USDINR": "USDINR",
+  "FXUSDINR": "USDINR",
+  "FX:EURUSD": "EURUSD",
+  "FXEURUSD": "EURUSD",
+  "BINANCE:BTCUSDT": "BINANCE:BTCUSDT",
+  "BINANCEBTCUSDT": "BINANCE:BTCUSDT",
+
+  // UI aliases
+  "NIFTY": "NIFTY",
+  "BANKNIFTY": "BANKNIFTY",
+  "USDINR": "USDINR",
+  "EURUSD": "EURUSD",
+  "BTCUSD": "BINANCE:BTCUSDT",
+};
+
+// ===== Normalize Function =====
+export function normalizeSymbol(symbol) {
   if (!symbol) return "";
-  const map = {
-    // Feed symbols
-    "NSE:NIFTY": "NIFTY",
-    "NSENIFTY": "NIFTY",
-    "NSE:BANKNIFTY": "BANKNIFTY",
-    "NSEBANKNIFTY": "BANKNIFTY",
-    "OANDA:XAU_USD": "OANDA:XAU_USD",
-    "OANDAXAUUSD": "OANDA:XAU_USD",
-    "BINANCE:BTCUSDT": "BINANCE:BTCUSDT",
-    "BINANCEBTCUSDT": "BINANCE:BTCUSDT",
-    "FX:USDINR": "USDINR",
-    "FXUSDINR": "USDINR",
-
-    // UI aliases
-    "NIFTY": "NIFTY",
-    "BANKNIFTY": "BANKNIFTY",
-    "USDINR": "USDINR",
-    "XAUUSD": "OANDA:XAU_USD",
-    "BTCUSD": "BINANCE:BTCUSDT",
-  };
-
   const upper = symbol.toUpperCase();
-  if (map[upper]) return map[upper];
 
+  // Direct match
+  if (FEED_SYMBOL_MAP[upper]) return FEED_SYMBOL_MAP[upper];
+
+  // Strip colon/underscore
   const stripped = upper.replace(/[:_]/g, "");
-  if (map[stripped]) return map[stripped];
+  if (FEED_SYMBOL_MAP[stripped]) return FEED_SYMBOL_MAP[stripped];
 
   return upper;
 }
 
-module.exports = {
-  CONTRACTS,
-  normalizeSymbol,
-};
+// ===== Display Function =====
+export function getDisplayName(symbol) {
+  const key = normalizeSymbol(symbol);
+  return CONTRACTS[key]?.display || key;
+}
