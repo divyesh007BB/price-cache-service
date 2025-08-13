@@ -33,11 +33,11 @@ async function loadInitialData() {
 
   const { data: poData, error: poErr } = await supabase.from("orders").select("*").eq("status", "pending");
   if (poErr) throw poErr;
-  pendingOrders = poData || [];
+  pendingOrders = (poData || []).map(o => ({ ...o, symbol: normalizeSymbol(o.symbol) }));
 
   const { data: otData, error: otErr } = await supabase.from("trades").select("*").eq("is_open", true);
   if (otErr) throw otErr;
-  openTrades = otData || [];
+  openTrades = (otData || []).map(t => ({ ...t, symbol: normalizeSymbol(t.symbol) }));
 
   console.log(`✅ Loaded ${accounts.size} accounts, ${pendingOrders.length} pending orders, ${openTrades.length} open trades`);
   broadcastSnapshot();
@@ -194,6 +194,7 @@ async function placeOrder(order) {
 
 // 📊 Fill order into a trade
 async function fillOrder(order, basePrice) {
+  order.symbol = normalizeSymbol(order.symbol);
   setTimeout(() => {
     const contract = getContracts()[order.symbol];
     const spread = contract?.spread || 0;
@@ -238,6 +239,7 @@ async function fillOrder(order, basePrice) {
 
 // 📉 Close a trade
 async function closeTrade(trade, closePrice) {
+  trade.symbol = normalizeSymbol(trade.symbol);
   const tickValue = getContracts()[trade.symbol]?.tickValue ?? 1;
   const pnl = trade.side === "buy"
     ? (closePrice - trade.entry_price) * trade.quantity * tickValue
