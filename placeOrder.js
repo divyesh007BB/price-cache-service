@@ -4,11 +4,14 @@ const { placeOrder } = require("./matchingEngine");
 const { broadcast } = require("./websocketServer");
 const { v4: uuidv4 } = require("uuid");
 
-// ✅ Import from backend symbolMap
-const { normalizeSymbol, CONTRACTS } = require("./symbolMap");
+// ✅ Import from backend symbolMap (getter version)
+const { normalizeSymbol, getContracts } = require("./symbolMap");
 
-// Build whitelist directly from CONTRACTS keys
-const WHITELIST = new Set(Object.keys(CONTRACTS));
+// ✅ Get whitelist dynamically so it updates after loadContractsFromDB()
+function getWhitelist() {
+  const contracts = getContracts();
+  return new Set(Object.keys(contracts || {}));
+}
 
 router.post("/place-order", async (req, res) => {
   try {
@@ -32,11 +35,11 @@ router.post("/place-order", async (req, res) => {
     if (!["buy", "sell"].includes(side)) return res.status(400).json({ status: "error", error: "Invalid side" });
     if (!["market", "limit"].includes(order_type)) return res.status(400).json({ status: "error", error: "Invalid order_type" });
 
-    // ✅ Normalize using shared function
+    // ✅ Normalize symbol
     const normSymbol = normalizeSymbol(symbol);
 
-    // ✅ Whitelist check
-    if (!WHITELIST.has(normSymbol)) {
+    // ✅ Whitelist check (dynamic)
+    if (!getWhitelist().has(normSymbol)) {
       return res.status(400).json({ status: "error", error: `Symbol not supported: ${symbol}` });
     }
 

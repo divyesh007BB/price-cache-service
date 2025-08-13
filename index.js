@@ -1,4 +1,3 @@
-// priceServer.js
 require("dotenv").config();
 const express = require("express");
 const WebSocket = require("ws");
@@ -14,6 +13,7 @@ const {
 } = require("./matchingEngine");
 const { evaluateOpenPositions } = require("./riskEngine");
 const placeOrderRoute = require("./placeOrder");
+const { loadContractsFromDB, getContracts, normalizeSymbol } = require("./symbolMap");
 
 const app = express();
 app.use(cors());
@@ -26,45 +26,73 @@ const PORT = process.env.PORT || 4000;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const DEV_MODE = process.env.NODE_ENV !== "production";
 
-// ✅ Supported symbols (NO GOLD)
-const WHITELIST = new Set([
-  "BTCUSD",
-  "BINANCE:BTCUSDT",
-  "NIFTY",
-  "BANKNIFTY",
-  "USDINR",
-  "EURUSD"
-]);
+// ✅ Dynamic symbol sets
+let WHITELIST = new Set();
+let FEED_MAP = {};
 
-// ✅ Map internal/alias → vendor feed symbol
-const FEED_MAP = {
-  BTCUSD: "BINANCE:BTCUSDT",
-  "BINANCE:BTCUSDT": "BINANCE:BTCUSDT",
-  NIFTY: "NSE:NIFTY",
-  BANKNIFTY: "NSE:BANKNIFTY",
-  USDINR: "FX:USDINR",
-  EURUSD: "FX:EURUSD"
-};
+// ✅ Load symbols from DB
+async function refreshInstruments() {
+  await loadContractsFromDB();
+  const CONTRACTS = getContracts();
+  if (!CONTRACTS || Object.keys(CONTRACTS).length === 0) {
+    console.warn("❌ No contracts loaded from DB");
+    return;
+  }
+  WHITELIST = new Set(Object.keys(CONTRACTS));
+  FEED_MAP = {};
+  for (const [code, meta] of Object.entries(CONTRACTS)) {
+    FEED_MAP[code] = meta.priceKey;
+    FEED_MAP[meta.priceKey] = meta.priceKey;
+  }
+  console.log("✅ Instruments loaded into price server:", WHITELIST);
+}
 
 // ✅ Price cache
 const priceCache = new Map();
-WHITELIST.forEach((s) => priceCache.set(s, { price: 0, ts: Date.now() }));
-
-// ✅ Start server
-const server = app.listen(PORT, async () => {
-  console.log(`🚀 Price server running on port ${PORT}`);
-  try {
-    await loadInitialData();
-  } catch (err) {
-    console.error("❌ Failed to load initial data:", err?.message || err);
-  }
-});
+function initPriceCache() {
+  WHITELIST.forEach((s) => priceCache.set(s, { price: 0, ts: Date.now() }));
+}
+initPriceCache();
 
 // ✅ WebSocket setup
 const wss = new WebSocket.Server({ noServer: true });
 function heartbeat() { this.isAlive = true; }
 
-// ✅ WS Auth
+function broadcast(msg) {
+  try {
+    const data = JSON.stringify(msg);
+    for (const client of wss.clients) {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(data);
+      }
+    }
+  } catch (err) {
+    console.error("❌ Broadcast error:", err.message);
+  }
+}
+setBroadcaster(broadcast);
+
+const server = app.listen(PORT, async () => {
+  console.log(`🚀 Price server running on port ${PORT}`);
+  try {
+    await loadInitialData();
+    await refreshInstruments();
+    initPriceCache();
+    startPolling();
+
+    // ♻️ Auto-refresh instruments every 10 minutes
+    setInterval(async () => {
+      console.log("🔄 Refreshing instruments from DB...");
+      await refreshInstruments();
+      initPriceCache();
+    }, 10 * 60 * 1000);
+    
+  } catch (err) {
+    console.error("❌ Failed during startup:", err?.message || err);
+  }
+});
+
+// ✅ WebSocket authentication
 server.on("upgrade", async (req, socket, head) => {
   const pathname = url.parse(req.url).pathname;
   const query = url.parse(req.url, true).query;
@@ -104,21 +132,17 @@ server.on("upgrade", async (req, socket, head) => {
 wss.on("connection", (ws) => {
   ws.isAlive = true;
   ws.on("pong", heartbeat);
-
   console.log("🔌 WS client connected");
   ws.send(JSON.stringify({ type: "welcome", symbols: Array.from(WHITELIST) }));
 
-  // ✅ Handle JSON pings as backup heartbeat
   ws.on("message", (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
       if (msg?.type === "ping") {
-        ws.isAlive = true; // treat as manual heartbeat
-        ws.send(JSON.stringify({ type: "pong" })); // optional ack for logs
+        ws.isAlive = true;
+        ws.send(JSON.stringify({ type: "pong" }));
       }
-    } catch {
-      // Ignore non-JSON messages (likely binary pings)
-    }
+    } catch {}
   });
 
   ws.on("close", (code, reason) => {
@@ -126,56 +150,13 @@ wss.on("connection", (ws) => {
   });
 });
 
-// ✅ Server-driven binary ping
 setInterval(() => {
   wss.clients.forEach((ws) => {
     if (!ws.isAlive) return ws.terminate();
     ws.isAlive = false;
-    ws.ping(); // browser auto-pongs
+    ws.ping();
   });
 }, 25000);
-
-// ✅ Broadcast helper
-function broadcast(msg) {
-  try {
-    const data = JSON.stringify(msg);
-    for (const client of wss.clients) {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(data);
-      }
-    }
-  } catch (err) {
-    console.error("❌ Broadcast error:", err.message);
-  }
-}
-setBroadcaster(broadcast);
-
-// ✅ Normalize incoming request symbols
-function normalizeIncomingSymbol(symbol) {
-  const upper = symbol.toUpperCase();
-  if (WHITELIST.has(upper)) return upper;
-  if (FEED_MAP[upper]) return upper;
-  return upper;
-}
-
-// ✅ REST endpoints
-app.get("/health", (_req, res) => res.json({ ok: true }));
-
-app.get("/latest-price/:symbol", (req, res) => {
-  let symbol = normalizeIncomingSymbol(req.params.symbol);
-  if (!WHITELIST.has(symbol)) {
-    return res.status(400).json({ error: `Symbol not supported: ${symbol}` });
-  }
-  const row = priceCache.get(symbol);
-  if (!row) return res.status(404).json({ error: "No price yet" });
-  res.json({ symbol, price: row.price, ts: row.ts });
-});
-
-app.get("/prices", (_req, res) => {
-  const out = {};
-  for (const [k, v] of priceCache.entries()) out[k] = v;
-  res.json(out);
-});
 
 // ✅ Price fetching logic
 async function fetchPrice(symbol) {
@@ -214,13 +195,17 @@ async function fetchPrice(symbol) {
   }
 }
 
-// ✅ Poll all symbols in WHITELIST
+// ✅ Start polling prices
 function startPolling() {
+  if (!WHITELIST || WHITELIST.size === 0) {
+    console.warn("⚠️ No symbols in WHITELIST — skipping polling");
+    return;
+  }
+  console.log("📡 Starting price polling for:", Array.from(WHITELIST));
   WHITELIST.forEach(sym => {
     setInterval(() => fetchPrice(sym), 5000);
   });
 }
-startPolling();
 
 process.on("unhandledRejection", (err) => console.error("🧯 UnhandledRejection:", err));
 process.on("uncaughtException", (err) => console.error("🧯 UncaughtException:", err));

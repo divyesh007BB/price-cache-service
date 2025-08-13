@@ -1,97 +1,72 @@
-// symbolMap.js (works for backend + supabase + frontend if imported correctly)
+// symbolMap.js — CommonJS dynamic loader
 
-// ✅ Contract meta info
-const CONTRACTS = {
-  NIFTY: {
-    qtyStep: 1,
-    minQty: 1,
-    priceKey: "NSE:NIFTY",
-    display: "NIFTY",
-    tickValue: 50,
-    convertToINR: true,
-    maxLots: { Evaluation: 20, Funded: 50 },
-    tradingHours: { start: 3.5, end: 10.5 }, // UTC hours
-    dailyLossLimit: 100000,
-    commission: 50,
-    spread: 0.5,
-  },
-  BANKNIFTY: {
-    qtyStep: 1,
-    minQty: 1,
-    priceKey: "NSE:BANKNIFTY",
-    display: "BANKNIFTY",
-    tickValue: 25,
-    convertToINR: true,
-    maxLots: { Evaluation: 10, Funded: 30 },
-    tradingHours: { start: 3.5, end: 10.5 },
-    dailyLossLimit: 150000,
-    commission: 50,
-    spread: 1,
-  },
-  "BINANCE:BTCUSDT": {
-    qtyStep: 0.01,
-    minQty: 0.01,
-    priceKey: "BINANCE:BTCUSDT",
-    display: "Bitcoin (BTC/USD)",
-    tickValue: 2000,
-    convertToINR: false,
-    maxLots: { Evaluation: 2, Funded: 5 },
-    tradingHours: { start: 0, end: 24 },
-    dailyLossLimit: 250000,
-    commission: 50,
-    spread: 5,
-  },
-  USDINR: {
-    qtyStep: 1,
-    minQty: 1,
-    priceKey: "FX:USDINR",
-    display: "USD/INR",
-    tickValue: 1000,
-    convertToINR: true,
-    maxLots: { Evaluation: 50, Funded: 100 },
-    tradingHours: { start: 2, end: 10.5 },
-    dailyLossLimit: 80000,
-    commission: 50,
-    spread: 0.02,
-  },
-  EURUSD: {
-    qtyStep: 1,
-    minQty: 1,
-    priceKey: "FX:EURUSD",
-    display: "EUR/USD",
-    tickValue: 1000,
-    convertToINR: false,
-    maxLots: { Evaluation: 50, Funded: 100 },
-    tradingHours: { start: 0, end: 24 },
-    dailyLossLimit: 100000,
-    commission: 50,
-    spread: 0.0002,
-  },
-};
+const { createClient } = require("@supabase/supabase-js");
 
-// ✅ Map external feed & UI symbols → backend normalized keys
-const FEED_SYMBOL_MAP = {
-  // Feed symbols
-  "NSE:NIFTY": "NIFTY",
-  "NSENIFTY": "NIFTY",
-  "NSE:BANKNIFTY": "BANKNIFTY",
-  "NSEBANKNIFTY": "BANKNIFTY",
-  "FX:USDINR": "USDINR",
-  "FXUSDINR": "USDINR",
-  "FX:EURUSD": "EURUSD",
-  "FXEURUSD": "EURUSD",
-  "BINANCE:BTCUSDT": "BINANCE:BTCUSDT",
-  "BINANCEBTCUSDT": "BINANCE:BTCUSDT",
+let supabase = null;
+if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
+} else {
+  console.warn(
+    "⚠️ Supabase credentials missing — CONTRACTS will remain empty until loaded."
+  );
+}
 
-  // UI aliases
-  NIFTY: "NIFTY",
-  BANKNIFTY: "BANKNIFTY",
-  USDINR: "USDINR",
-  EURUSD: "EURUSD",
-  BTCUSD: "BINANCE:BTCUSDT",
-};
+let CONTRACTS = {};
+let FEED_SYMBOL_MAP = {};
 
-// ✅ Normalize any incoming symbol to match CONTRACTS keys
+/**
+ * Load instruments from Supabase
+ */
+async function loadContractsFromDB() {
+  if (!supabase) {
+    console.warn("⚠️ Skipping instrument load — no Supabase client.");
+    return;
+  }
+
+  const { data, error } = await supabase
+    .from("instruments")
+    .select("*")
+    .eq("is_active", true);
+
+  if (error) {
+    console.error("❌ Failed to load instruments from Supabase:", error.message);
+    throw error;
+  }
+
+  CONTRACTS = {};
+  FEED_SYMBOL_MAP = {};
+
+  data.forEach((row) => {
+    CONTRACTS[row.code] = {
+      qtyStep: row.lot_step,
+      minQty: row.min_qty,
+      priceKey: row.feed_code,
+      display: row.display_name,
+      tickValue: row.tick_value,
+      convertToINR: row.convert_to_inr,
+      maxLots: { Evaluation: row.max_lots_eval, Funded: row.max_lots_funded },
+      tradingHours: row.trading_hours,
+      dailyLossLimit: row.daily_loss_limit,
+      commission: row.commission,
+      spread: row.spread,
+    };
+
+    FEED_SYMBOL_MAP[row.feed_code.toUpperCase()] = row.code;
+    FEED_SYMBOL_MAP[row.code.toUpperCase()] = row.code;
+
+    FEED_SYMBOL_MAP[row.feed_code.replace(/[:_]/g, "").toUpperCase()] = row.code;
+    FEED_SYMBOL_MAP[row.code.replace(/[:_]/g, "").toUpperCase()] = row.code;
+  });
+
+  console.log("✅ Loaded instruments:", Object.keys(CONTRACTS));
+}
+
+/**
+ * Normalize symbol
+ */
 function normalizeSymbol(symbol) {
   if (!symbol) return "";
   const upper = symbol.toUpperCase();
@@ -101,14 +76,29 @@ function normalizeSymbol(symbol) {
   return upper;
 }
 
-// ✅ Get display name
+/**
+ * Get display name
+ */
 function getDisplayName(symbol) {
   const key = normalizeSymbol(symbol);
   return CONTRACTS[key]?.display || key;
 }
 
+/**
+ * Getters to avoid stale exports
+ */
+function getContracts() {
+  return CONTRACTS;
+}
+
+function getFeedSymbolMap() {
+  return FEED_SYMBOL_MAP;
+}
+
 module.exports = {
-  CONTRACTS,
+  getContracts,
+  getFeedSymbolMap,
   normalizeSymbol,
   getDisplayName,
+  loadContractsFromDB,
 };
