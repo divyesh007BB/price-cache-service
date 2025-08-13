@@ -1,5 +1,3 @@
-// symbolMap.js
-
 /**
  * Contract meta info for each tradable instrument.
  */
@@ -72,18 +70,38 @@ const CONTRACTS = {
 };
 
 /**
- * Maps external feed symbols → backend contract key
+ * Maps external feed symbols & UI aliases → backend contract key
  */
 function normalizeSymbol(symbol) {
   if (!symbol) return "";
   const map = {
+    // Feed symbols
     "NSE:NIFTY": "NIFTY",
+    "NSENIFTY": "NIFTY",
     "NSE:BANKNIFTY": "BANKNIFTY",
+    "NSEBANKNIFTY": "BANKNIFTY",
     "OANDA:XAU_USD": "OANDA:XAU_USD",
+    "OANDAXAUUSD": "OANDA:XAU_USD",
     "BINANCE:BTCUSDT": "BINANCE:BTCUSDT",
+    "BINANCEBTCUSDT": "BINANCE:BTCUSDT",
     "FX:USDINR": "USDINR",
+    "FXUSDINR": "USDINR",
+
+    // UI aliases
+    "NIFTY": "NIFTY",
+    "BANKNIFTY": "BANKNIFTY",
+    "USDINR": "USDINR",
+    "XAUUSD": "OANDA:XAU_USD",
+    "BTCUSD": "BINANCE:BTCUSDT",
   };
-  return map[symbol] || symbol.toUpperCase();
+
+  const upper = symbol.toUpperCase();
+  if (map[upper]) return map[upper];
+
+  const stripped = upper.replace(/[:_]/g, "");
+  if (map[stripped]) return map[stripped];
+
+  return upper;
 }
 
 module.exports = {
