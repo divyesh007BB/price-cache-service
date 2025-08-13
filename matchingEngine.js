@@ -1,8 +1,9 @@
 require("dotenv").config();
 const { createClient } = require("@supabase/supabase-js");
 const { v4: uuidv4 } = require("uuid");
-const { normalizeSymbol, CONTRACTS } = require("./symbolMap");
+const { normalizeSymbol, getContracts, loadContractsFromDB } = require("./symbolMap");
 const { priceCache } = require("./state"); // ✅ Shared state
+
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 let wsBroadcast = () => {};
@@ -19,6 +20,9 @@ const PARTIAL_FILL_RATIO = 0.5;
 // 📦 Load accounts, orders, and trades
 async function loadInitialData() {
   console.log("📦 Loading initial data from Supabase...");
+
+  // ✅ Ensure contracts are loaded first
+  await loadContractsFromDB();
 
   const { data: accData, error: accErr } = await supabase.from("accounts").select("*");
   if (accErr) throw accErr;
@@ -84,7 +88,7 @@ async function placeOrder(order) {
   order.symbol = normalizeSymbol(order.symbol);
 
   const account = accounts.get(order.account_id);
-  const contract = CONTRACTS[order.symbol];
+  const contract = getContracts()[order.symbol];
   if (!contract) {
     console.warn(`❌ Symbol not supported: ${order.symbol}`);
     return;
@@ -126,7 +130,7 @@ async function placeOrder(order) {
 // 📊 Fill order
 async function fillOrder(order, basePrice) {
   setTimeout(async () => {
-    const contract = CONTRACTS[order.symbol];
+    const contract = getContracts()[order.symbol];
     const spread = contract?.spread || 0;
     const commission = contract?.commission || 0;
 
@@ -254,7 +258,7 @@ async function runRiskEngine(trade, account) {
 function withinTradingHours(symbol) {
   const nowUTC = new Date();
   const hours = nowUTC.getUTCHours() + nowUTC.getUTCMinutes() / 60;
-  const contract = CONTRACTS[symbol];
+  const contract = getContracts()[symbol];
   if (!contract?.tradingHours) return true;
   return hours >= contract.tradingHours.start && hours <= contract.tradingHours.end;
 }

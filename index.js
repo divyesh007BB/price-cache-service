@@ -68,11 +68,17 @@ function broadcast(msg) {
 }
 setBroadcaster(broadcast);
 
+// ✅ Server start
 const server = app.listen(PORT, async () => {
   console.log(`🚀 Price server running on port ${PORT}`);
   try {
-    await loadInitialData();
+    // 1️⃣ Load contracts first so CONTRACTS & FEED_MAP are ready
     await refreshInstruments();
+
+    // 2️⃣ Then load accounts, pending orders, and open trades
+    await loadInitialData();
+
+    // 3️⃣ Start polling prices
     startPolling();
 
     // ♻️ Auto-refresh instruments every 10 minutes
@@ -80,7 +86,7 @@ const server = app.listen(PORT, async () => {
       console.log("🔄 Refreshing instruments from DB...");
       await refreshInstruments();
     }, 10 * 60 * 1000);
-    
+
   } catch (err) {
     console.error("❌ Failed during startup:", err?.message || err);
   }
