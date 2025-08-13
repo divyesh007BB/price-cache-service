@@ -22,9 +22,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ✅ Routes
-app.use("/", placeOrderRoute);
-
 const PORT = process.env.PORT || 4000;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const DEV_MODE = process.env.NODE_ENV !== "production";
@@ -50,6 +47,29 @@ async function refreshInstruments() {
   console.log("✅ Instruments loaded into price server:", Array.from(WHITELIST));
 }
 
+// ✅ Token verification middleware
+async function verifyAuth(req, res, next) {
+  if (DEV_MODE) return next();
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: "Missing Authorization" });
+
+  const token = authHeader.replace("Bearer ", "");
+  try {
+    const { data, error } = await supabaseAdmin.auth.getUser(token);
+    if (error || !data?.user) {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+    req.user = data.user;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: err.message });
+  }
+}
+
+// ✅ Routes
+app.use("/", placeOrderRoute);                 // existing root
+app.use("/executeOrder", verifyAuth, placeOrderRoute); // direct endpoint with auth
+
 // ✅ WebSocket setup
 const wss = new WebSocket.Server({ noServer: true });
 function heartbeat() { this.isAlive = true; }
@@ -72,21 +92,10 @@ setBroadcaster(broadcast);
 const server = app.listen(PORT, async () => {
   console.log(`🚀 Price server running on port ${PORT}`);
   try {
-    // 1️⃣ Load contracts first so CONTRACTS & FEED_MAP are ready
     await refreshInstruments();
-
-    // 2️⃣ Then load accounts, pending orders, and open trades
     await loadInitialData();
-
-    // 3️⃣ Start polling prices
     startPolling();
-
-    // ♻️ Auto-refresh instruments every 10 minutes
-    setInterval(async () => {
-      console.log("🔄 Refreshing instruments from DB...");
-      await refreshInstruments();
-    }, 10 * 60 * 1000);
-
+    setInterval(refreshInstruments, 10 * 60 * 1000);
   } catch (err) {
     console.error("❌ Failed during startup:", err?.message || err);
   }
@@ -100,27 +109,22 @@ server.on("upgrade", async (req, socket, head) => {
 
   if (pathname === "/ws") {
     if (!token && !DEV_MODE) {
-      console.warn("❌ No token provided, closing connection");
       socket.destroy();
       return;
     }
-
     if (token && !DEV_MODE) {
       try {
         const { data, error } = await supabaseAdmin.auth.getUser(token);
         if (error || !data?.user) {
-          console.warn("❌ Invalid token, closing WS");
           socket.destroy();
           return;
         }
         console.log(`✅ Authenticated user: ${data.user.id}`);
       } catch (err) {
-        console.error("❌ Token validation error:", err.message);
         socket.destroy();
         return;
       }
     }
-
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit("connection", ws, req);
     });
@@ -165,7 +169,6 @@ async function fetchPrice(symbol) {
 
   try {
     const vendorSymbol = FEED_MAP[symbol] || symbol;
-
     if (vendorSymbol.startsWith("NSE:")) {
       const yahooMap = {
         "NSE:NIFTY": "^NSEI",
