@@ -1,3 +1,5 @@
+// index.js — Price server + order matching (patched for continuous ticks & cache priming + full sync_state)
+
 require("dotenv").config();
 const express = require("express");
 const WebSocket = require("ws");
@@ -9,7 +11,10 @@ const { supabaseAdmin } = require("./config");
 const {
   loadInitialData,
   processTick,
-  setBroadcaster
+  setBroadcaster,
+  getAccounts,
+  getOpenTrades,
+  getPendingOrders
 } = require("./matchingEngine");
 const { evaluateOpenPositions } = require("./riskEngine");
 const placeOrderRoute = require("./placeOrder");
@@ -28,8 +33,9 @@ const DEV_MODE = process.env.NODE_ENV !== "production";
 
 // ✅ Feed map for fetching vendor prices
 let FEED_MAP = {};
+let pollingIntervals = new Map(); // Track intervals per symbol
 
-// ✅ Load symbols from DB and populate shared state
+// ✅ Load symbols from DB and populate shared state + restart polling
 async function refreshInstruments() {
   await loadContractsFromDB();
   const CONTRACTS = getContracts();
@@ -44,7 +50,22 @@ async function refreshInstruments() {
     FEED_MAP[code] = meta.priceKey;
     FEED_MAP[meta.priceKey] = meta.priceKey;
   }
-  console.log("✅ Instruments loaded into price server:", Array.from(WHITELIST));
+  console.log("✅ Instruments loaded:", Array.from(WHITELIST));
+
+  restartPolling();
+}
+
+// ✅ Restart polling whenever instruments change
+function restartPolling() {
+  pollingIntervals.forEach(clearInterval);
+  pollingIntervals.clear();
+
+  WHITELIST.forEach(sym => {
+    fetchPrice(sym); // Prime cache immediately
+    const intv = setInterval(() => fetchPrice(sym), 5000);
+    pollingIntervals.set(sym, intv);
+  });
+  console.log("📡 Polling started for:", Array.from(WHITELIST));
 }
 
 // ✅ Token verification middleware
@@ -67,8 +88,8 @@ async function verifyAuth(req, res, next) {
 }
 
 // ✅ Routes
-app.use("/", placeOrderRoute);                 // existing root
-app.use("/executeOrder", verifyAuth, placeOrderRoute); // direct endpoint with auth
+app.use("/", placeOrderRoute);
+app.use("/executeOrder", verifyAuth, placeOrderRoute);
 
 // ✅ WebSocket setup
 const wss = new WebSocket.Server({ noServer: true });
@@ -94,7 +115,6 @@ const server = app.listen(PORT, async () => {
   try {
     await refreshInstruments();
     await loadInitialData();
-    startPolling();
     setInterval(refreshInstruments, 10 * 60 * 1000);
   } catch (err) {
     console.error("❌ Failed during startup:", err?.message || err);
@@ -137,7 +157,25 @@ wss.on("connection", (ws) => {
   ws.isAlive = true;
   ws.on("pong", heartbeat);
   console.log("🔌 WS client connected");
+
+  // Send welcome + latest snapshot
   ws.send(JSON.stringify({ type: "welcome", symbols: Array.from(WHITELIST) }));
+  ws.send(JSON.stringify({
+    type: "sync_state",
+    accounts: getAccounts(),
+    pendingOrders: getPendingOrders(),
+    openTrades: getOpenTrades()
+  }));
+
+  // Send current prices immediately
+  WHITELIST.forEach(sym => {
+    const cached = priceCache.get(sym);
+    if (cached) {
+      ws.send(JSON.stringify({ type: "price", symbol: sym, price: cached.price, ts: cached.ts }));
+    } else {
+      fetchPrice(sym);
+    }
+  });
 
   ws.on("message", (raw) => {
     try {
@@ -196,18 +234,6 @@ async function fetchPrice(symbol) {
   } catch (err) {
     console.error(`❌ Price fetch fail ${symbol}:`, err.message);
   }
-}
-
-// ✅ Start polling prices
-function startPolling() {
-  if (!WHITELIST || WHITELIST.size === 0) {
-    console.warn("⚠️ No symbols in WHITELIST — skipping polling");
-    return;
-  }
-  console.log("📡 Starting price polling for:", Array.from(WHITELIST));
-  WHITELIST.forEach(sym => {
-    setInterval(() => fetchPrice(sym), 5000);
-  });
 }
 
 process.on("unhandledRejection", (err) => console.error("🧯 UnhandledRejection:", err));

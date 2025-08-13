@@ -1,8 +1,9 @@
-// matchingEngine.js — Real prop firm style execution (patched)
+// matchingEngine.js — Real prop firm style execution (with live-fetch fallback)
 
 require("dotenv").config();
 const { createClient } = require("@supabase/supabase-js");
 const { v4: uuidv4 } = require("uuid");
+const fetch = require("node-fetch");
 const { normalizeSymbol, getContracts, loadContractsFromDB } = require("./symbolMap");
 const { priceCache } = require("./state");
 
@@ -17,7 +18,8 @@ let openTrades = [];
 const EXECUTION_LATENCY_MS = 150;
 const ENABLE_PARTIAL_FILLS = false;
 const PARTIAL_FILL_RATIO = 0.5;
-const SLTP_GRACE_MS = 1000; // ✅ Grace period for SL/TP after fill
+const SLTP_GRACE_MS = 1000;
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 // ====================
 
 // 📦 Load initial state from DB
@@ -38,7 +40,6 @@ async function loadInitialData() {
   openTrades = otData || [];
 
   console.log(`✅ Loaded ${accounts.size} accounts, ${pendingOrders.length} pending orders, ${openTrades.length} open trades`);
-
   broadcastSnapshot();
 }
 
@@ -55,9 +56,51 @@ function broadcastSnapshot() {
   });
 }
 
+// 📡 Live fetch fallback for price
+async function fetchPriceNow(symbol) {
+  const contracts = getContracts();
+  const meta = contracts[symbol];
+  if (!meta) return null;
+
+  const ts = Date.now();
+  let price = null;
+  const vendorSymbol = meta.priceKey || symbol;
+
+  try {
+    if (vendorSymbol.startsWith("NSE:")) {
+      const yahooMap = {
+        "NSE:NIFTY": "^NSEI",
+        "NSE:BANKNIFTY": "^NSEBANK"
+      };
+      const yahooSymbol = yahooMap[vendorSymbol];
+      if (!yahooSymbol) return null;
+      const res = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?interval=1m`);
+      if (!res.ok) throw new Error(`Yahoo HTTP ${res.status}`);
+      const data = await res.json();
+      price = data?.chart?.result?.[0]?.meta?.regularMarketPrice ?? null;
+    } else {
+      const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${vendorSymbol}&token=${FINNHUB_API_KEY}`);
+      if (!res.ok) throw new Error(`Finnhub HTTP ${res.status}`);
+      const data = await res.json();
+      if (typeof data.c === "number" && data.c > 0) price = data.c;
+    }
+
+    if (price && price > 0) {
+      priceCache.set(symbol, { price, ts });
+      return price;
+    }
+  } catch (err) {
+    console.error(`❌ fetchPriceNow fail ${symbol}:`, err.message);
+  }
+  return null;
+}
+
 // 📡 Price tick handler
 async function processTick(symbol, price) {
   const normSymbol = normalizeSymbol(symbol);
+  priceCache.set(normSymbol, { price, ts: Date.now() });
+
+  wsBroadcast({ type: "price", symbol: normSymbol, price, ts: Date.now() });
 
   // Fill pending limits
   const toFill = pendingOrders.filter(o =>
@@ -73,7 +116,6 @@ async function processTick(symbol, price) {
   const toClose = openTrades.filter(t => {
     if (t.symbol !== normSymbol) return false;
     if (Date.now() - new Date(t.time_opened).getTime() < SLTP_GRACE_MS) return false;
-
     if (t.side === "buy") {
       if (t.stop_loss != null && price <= t.stop_loss) return true;
       if (t.take_profit != null && price >= t.take_profit) return true;
@@ -83,7 +125,6 @@ async function processTick(symbol, price) {
     }
     return false;
   });
-
   for (const trade of toClose) {
     await closeTrade(trade, price);
   }
@@ -95,7 +136,6 @@ async function placeOrder(order) {
   const account = accounts.get(order.account_id);
   const contract = getContracts()[order.symbol];
   if (!contract) return console.warn(`❌ Symbol not supported: ${order.symbol}`);
-
   if (!withinTradingHours(order.symbol)) return console.warn(`❌ Market closed for ${order.symbol}`);
 
   if (account && contract.maxLots?.[account.account_type]) {
@@ -106,12 +146,16 @@ async function placeOrder(order) {
   }
 
   if (order.type === "market") {
-    const cached = priceCache.get(order.symbol);
-    if (!cached?.price) return console.error(`❌ No live price in cache for ${order.symbol}`);
+    let cached = priceCache.get(order.symbol);
+    if (!cached?.price) {
+      console.warn(`⚠ No cached price for ${order.symbol}, fetching live...`);
+      const live = await fetchPriceNow(order.symbol);
+      if (live) cached = { price: live, ts: Date.now() };
+    }
+    if (!cached?.price) return console.error(`❌ Still no live price for ${order.symbol}`);
     const execPrice = convertPrice(order.symbol, cached.price);
     const orderId = order.id || uuidv4();
 
-    // DB write is async — we fill immediately
     supabase.from("orders").insert({
       id: orderId,
       account_id: order.account_id,
@@ -155,7 +199,7 @@ async function fillOrder(order, basePrice) {
     const spread = contract?.spread || 0;
     const commission = contract?.commission || 0;
     const execPrice = order.side === "buy" ? basePrice + spread : basePrice - spread;
-    let sizeToFill = ENABLE_PARTIAL_FILLS ? Math.ceil(order.size * PARTIAL_FILL_RATIO) : order.size;
+    const sizeToFill = ENABLE_PARTIAL_FILLS ? Math.ceil(order.size * PARTIAL_FILL_RATIO) : order.size;
 
     const trade = {
       id: uuidv4(),
@@ -173,15 +217,12 @@ async function fillOrder(order, basePrice) {
       pnl: -commission * sizeToFill
     };
 
-    // Memory update first
     pendingOrders = pendingOrders.filter(o => o.id !== order.id);
     openTrades.push(trade);
 
-    // Broadcast updates
     wsBroadcast({ type: "trade_fill", trade });
     broadcastSnapshot();
 
-    // Async DB writes
     if (order.id) {
       supabase.from("orders").update({
         status: "filled",
@@ -205,14 +246,10 @@ async function closeTrade(trade, closePrice) {
 
   const closedTrade = { ...trade, is_open: false, status: "closed", time_closed: new Date().toISOString(), exit_price: closePrice, pnl: netPnL };
 
-  // Memory update first
   openTrades = openTrades.filter(t => t.id !== trade.id);
-
-  // Broadcast updates
   wsBroadcast({ type: "trade_close", trade: closedTrade });
   broadcastSnapshot();
 
-  // Async DB update
   supabase.from("trades").update(closedTrade).eq("id", trade.id).catch(err => console.error("Trade update error:", err));
 
   const acc = accounts.get(trade.account_id);
@@ -224,7 +261,6 @@ async function closeTrade(trade, closePrice) {
     supabase.from("accounts").update({ current_balance: acc.current_balance }).eq("id", acc.id).catch(err => console.error("Account update error:", err));
     runRiskEngine(closedTrade, acc);
 
-    // MIL check
     if (acc.max_intraday_loss) {
       const today = new Date().toISOString().split("T")[0];
       supabase.from("trades")
@@ -289,6 +325,9 @@ function getOpenTrades() {
 function getAccounts() {
   return Array.from(accounts.values());
 }
+function getPendingOrders() {
+  return pendingOrders;
+}
 
 module.exports = {
   loadInitialData,
@@ -298,5 +337,6 @@ module.exports = {
   fillOrder,
   closeTrade,
   getOpenTrades,
-  getAccounts
+  getAccounts,
+  getPendingOrders
 };

@@ -1,13 +1,13 @@
-// placeOrder.js — production ready (WS events aligned with matchingEngine.js)
+// placeOrder.js — streamlined to use matchingEngine directly
 
 const express = require("express");
 const router = express.Router();
 const { placeOrder } = require("./matchingEngine");
-const { broadcast } = require("./websocketServer");
-const { v4: uuidv4 } = require("uuid");
 const { normalizeSymbol, getContracts } = require("./symbolMap");
-const { priceCache, WHITELIST } = require("./state");
+const { WHITELIST } = require("./state");
+const { v4: uuidv4 } = require("uuid");
 
+// ✅ Use matchingEngine for all execution — no manual fills here
 function getWhitelist() {
   return WHITELIST && WHITELIST.size > 0
     ? WHITELIST
@@ -33,20 +33,24 @@ router.post("/place-order", async (req, res) => {
     if (!user_id) return res.status(400).json({ status: "error", error: "Missing user_id" });
     if (!account_id) return res.status(400).json({ status: "error", error: "Missing account_id" });
     if (!symbol) return res.status(400).json({ status: "error", error: "Missing symbol" });
-    if (!["buy", "sell"].includes(side.toLowerCase())) return res.status(400).json({ status: "error", error: "Invalid side" });
-    if (!["market", "limit"].includes(order_type.toLowerCase())) return res.status(400).json({ status: "error", error: "Invalid order_type" });
+    if (!["buy", "sell"].includes(side.toLowerCase())) {
+      return res.status(400).json({ status: "error", error: "Invalid side" });
+    }
+    if (!["market", "limit"].includes(order_type.toLowerCase())) {
+      return res.status(400).json({ status: "error", error: "Invalid order_type" });
+    }
     if (order_type.toLowerCase() === "limit" && !limit_price) {
       return res.status(400).json({ status: "error", error: "Limit orders require limit_price" });
     }
 
-    // ===== Symbol normalization =====
+    // ===== Symbol normalization & whitelist check =====
     const normSymbol = normalizeSymbol(symbol);
     if (!getWhitelist().has(normSymbol)) {
       console.warn(`❌ Rejected order — Symbol not in whitelist: ${symbol} (${normSymbol})`);
       return res.status(400).json({ status: "error", error: `Symbol not supported: ${symbol}` });
     }
 
-    // ===== Build base order =====
+    // ===== Build the order object for matchingEngine =====
     const order = {
       id: uuidv4(),
       user_id,
@@ -63,52 +67,15 @@ router.post("/place-order", async (req, res) => {
       idempotency_key: idempotency_key || null
     };
 
-    // ===== MARKET ORDER =====
-    if (order.type === "market") {
-      const cached = priceCache.get(normSymbol);
-      if (!cached || !cached.price) {
-        console.warn(`❌ No live price available for ${normSymbol}`);
-        return res.status(400).json({ status: "error", error: `No live price for ${normSymbol}` });
-      }
-
-      // Convert if needed
-      const contractMeta = getContracts()[normSymbol];
-      let finalPrice = cached.price;
-      if (contractMeta?.convertToINR) {
-        const usdInr = priceCache.get("USDINR")?.price ?? 83;
-        finalPrice = cached.price * usdInr;
-      }
-
-      order.entry_price = Number(finalPrice);
-      order.price = Number(finalPrice); // legacy field
-      order.status = "filled";
-      order.is_open = true;
-      order.time_opened = new Date().toISOString();
-
-      console.log(`✅ Filled market order ${order.id} @ ${order.entry_price}`);
-
-      await placeOrder(order); // matchingEngine handles DB & WS
-
-      // ✅ WS consistency: send as `trade`
-      broadcast({ type: "trade_fill", trade: order });
-
-      return res.json({
-        status: "success",
-        message: `Market order filled at ${order.entry_price}`,
-        trade: order
-      });
-    }
-
-    // ===== LIMIT ORDER =====
-    order.status = "pending"; // stays pending until matchingEngine.fillOrder triggers
+    // ===== Pass to matchingEngine =====
     await placeOrder(order);
-
-    // ✅ WS consistency: send as `order_pending`
-    broadcast({ type: "order_pending", order });
 
     return res.json({
       status: "success",
-      message: `Limit order accepted at ${order.limit_price}`,
+      message:
+        order.type === "market"
+          ? "Market order sent for execution"
+          : `Limit order accepted at ${order.limit_price}`,
       order
     });
 
