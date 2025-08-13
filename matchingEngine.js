@@ -152,13 +152,12 @@ async function placeOrder(order) {
   }
 }
 
-// 📊 Fill order into a trade — single source for market & limit
+// 📊 Fill order into a trade
 async function fillOrder(order, basePrice) {
   setTimeout(async () => {
     const contract = getContracts()[order.symbol];
     const spread = contract?.spread || 0;
     const commission = contract?.commission || 0;
-    const tickValue = contract?.tickValue ?? 1;
 
     const execPrice = order.side === "buy" ? basePrice + spread : basePrice - spread;
 
@@ -184,7 +183,6 @@ async function fillOrder(order, basePrice) {
       pnl: -commission * sizeToFill
     };
 
-    // Update order status
     if (order.id) {
       await supabase.from("orders").update({
         status: "filled",
@@ -198,7 +196,8 @@ async function fillOrder(order, basePrice) {
     pendingOrders = pendingOrders.filter(o => o.id !== order.id);
     openTrades.push(trade);
 
-    wsBroadcast({ type: "trade_fill", data: trade });
+    // ✅ FIX: Send as `trade`
+    wsBroadcast({ type: "trade_fill", trade });
 
     console.log(`✅ Filled order ${order.id} at ${execPrice}`);
   }, EXECUTION_LATENCY_MS);
@@ -232,7 +231,6 @@ async function closeTrade(trade, closePrice) {
 
     await runRiskEngine(closedTrade, acc);
 
-    // MIL check
     if (acc.max_intraday_loss) {
       const today = new Date().toISOString().split("T")[0];
       const { data: todayClosed, error } = await supabase
@@ -264,7 +262,9 @@ async function closeTrade(trade, closePrice) {
   }
 
   openTrades = openTrades.filter(t => t.id !== trade.id);
-  wsBroadcast({ type: "trade_close", data: closedTrade });
+
+  // ✅ FIX: Send as `trade`
+  wsBroadcast({ type: "trade_close", trade: closedTrade });
 }
 
 // 🌐 Risk Engine hook
@@ -293,7 +293,6 @@ async function runRiskEngine(trade, account) {
   }
 }
 
-// Price conversion helper
 function convertPrice(symbol, price) {
   const meta = getContracts()[symbol];
   if (meta?.convertToINR) {

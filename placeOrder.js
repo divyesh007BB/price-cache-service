@@ -1,4 +1,4 @@
-// placeOrder.js — production ready
+// placeOrder.js — production ready (WS events aligned with matchingEngine.js)
 
 const express = require("express");
 const router = express.Router();
@@ -80,7 +80,7 @@ router.post("/place-order", async (req, res) => {
       }
 
       order.entry_price = Number(finalPrice);
-      order.price = Number(finalPrice); // for backward compatibility
+      order.price = Number(finalPrice); // legacy field
       order.status = "filled";
       order.is_open = true;
       order.time_opened = new Date().toISOString();
@@ -89,19 +89,22 @@ router.post("/place-order", async (req, res) => {
 
       await placeOrder(order); // matchingEngine handles DB & WS
 
-      broadcast({ type: "order_update", data: order });
+      // ✅ WS consistency: send as `trade`
+      broadcast({ type: "trade_fill", trade: order });
 
       return res.json({
         status: "success",
         message: `Market order filled at ${order.entry_price}`,
-        order
+        trade: order
       });
     }
 
     // ===== LIMIT ORDER =====
     order.status = "pending"; // stays pending until matchingEngine.fillOrder triggers
     await placeOrder(order);
-    broadcast({ type: "order_update", data: order });
+
+    // ✅ WS consistency: send as `order_pending`
+    broadcast({ type: "order_pending", order });
 
     return res.json({
       status: "success",
