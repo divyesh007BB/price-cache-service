@@ -1,4 +1,4 @@
-// placeOrder.js — Prop firm grade validation before matchingEngine execution
+// placeOrder.js — Prop firm grade validation before matchingEngine execution (Redis-based)
 
 const express = require("express");
 const router = express.Router();
@@ -8,17 +8,25 @@ const { WHITELIST } = require("./state");
 const { v4: uuidv4 } = require("uuid");
 const { createClient } = require("@supabase/supabase-js");
 const { preTradeRiskCheck } = require("./riskEngine");
+const Redis = require("ioredis");
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
 
+const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379");
+
 // ===== Helper =====
 function getWhitelist() {
   return WHITELIST && WHITELIST.size > 0
     ? WHITELIST
     : new Set(Object.keys(getContracts() || {}));
+}
+
+async function getPriceFromRedis(symbol) {
+  const raw = await redis.get(`price:${symbol}`);
+  return raw ? JSON.parse(raw) : null;
 }
 
 router.post("/place-order", async (req, res) => {
@@ -58,7 +66,7 @@ router.post("/place-order", async (req, res) => {
     if (!contract)
       return res.status(400).json({ error: "CONTRACT_META_NOT_FOUND" });
 
-    // ===== Trading hours check =====
+    // ===== Trading hours check (if applicable) =====
     const nowUTC = new Date();
     const hoursUTC = nowUTC.getUTCHours() + nowUTC.getUTCMinutes() / 60;
     if (contract.tradingHours) {
@@ -76,7 +84,7 @@ router.post("/place-order", async (req, res) => {
     if (!riskCheck.ok)
       return res.status(400).json({ error: riskCheck.error });
 
-    // ===== Idempotency check (prevent accidental double orders) =====
+    // ===== Idempotency check =====
     if (idempotency_key) {
       const { data: existingOrder } = await supabase
         .from("trades")
@@ -96,6 +104,16 @@ router.post("/place-order", async (req, res) => {
       }
     }
 
+    // ===== Get latest price for market orders from Redis =====
+    let entryPrice = null;
+    if (order_type.toLowerCase() === "market") {
+      const cached = await getPriceFromRedis(normSymbol);
+      if (!cached || !cached.price) {
+        return res.status(400).json({ error: "NO_LIVE_PRICE" });
+      }
+      entryPrice = cached.price;
+    }
+
     // ===== Build order object =====
     const order = {
       id: uuidv4(),
@@ -108,7 +126,7 @@ router.post("/place-order", async (req, res) => {
       stop_loss: stop_loss ? Number(stop_loss) : null,
       take_profit: take_profit ? Number(take_profit) : null,
       limit_price: limit_price ? Number(limit_price) : null,
-      entry_price: null,
+      entry_price: entryPrice,
       created_at: new Date().toISOString(),
       idempotency_key: idempotency_key || null
     };
