@@ -1,4 +1,4 @@
-// placeOrder.js — streamlined to use matchingEngine directly
+// placeOrder.js — Prop firm grade validation before matchingEngine execution
 
 const express = require("express");
 const router = express.Router();
@@ -6,8 +6,15 @@ const { placeOrder } = require("./matchingEngine");
 const { normalizeSymbol, getContracts } = require("./symbolMap");
 const { WHITELIST } = require("./state");
 const { v4: uuidv4 } = require("uuid");
+const { createClient } = require("@supabase/supabase-js");
+const { preTradeRiskCheck } = require("./riskEngine");
 
-// ✅ Use matchingEngine for all execution — no manual fills here
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
+
+// ===== Helper =====
 function getWhitelist() {
   return WHITELIST && WHITELIST.size > 0
     ? WHITELIST
@@ -29,28 +36,67 @@ router.post("/place-order", async (req, res) => {
       idempotency_key
     } = req.body;
 
-    // ===== Validation =====
-    if (!user_id) return res.status(400).json({ status: "error", error: "Missing user_id" });
-    if (!account_id) return res.status(400).json({ status: "error", error: "Missing account_id" });
-    if (!symbol) return res.status(400).json({ status: "error", error: "Missing symbol" });
-    if (!["buy", "sell"].includes(side.toLowerCase())) {
-      return res.status(400).json({ status: "error", error: "Invalid side" });
-    }
-    if (!["market", "limit"].includes(order_type.toLowerCase())) {
-      return res.status(400).json({ status: "error", error: "Invalid order_type" });
-    }
-    if (order_type.toLowerCase() === "limit" && !limit_price) {
-      return res.status(400).json({ status: "error", error: "Limit orders require limit_price" });
-    }
+    console.log(`📝 Incoming order: ${JSON.stringify(req.body)}`);
 
-    // ===== Symbol normalization & whitelist check =====
+    // ===== Basic input validation =====
+    if (!user_id) return res.status(400).json({ error: "Missing user_id" });
+    if (!account_id) return res.status(400).json({ error: "Missing account_id" });
+    if (!symbol) return res.status(400).json({ error: "Missing symbol" });
+    if (!["buy", "sell"].includes(side?.toLowerCase()))
+      return res.status(400).json({ error: "Invalid side" });
+    if (!["market", "limit"].includes(order_type?.toLowerCase()))
+      return res.status(400).json({ error: "Invalid order_type" });
+    if (order_type.toLowerCase() === "limit" && !limit_price)
+      return res.status(400).json({ error: "Limit orders require limit_price" });
+
+    // ===== Symbol whitelist check =====
     const normSymbol = normalizeSymbol(symbol);
-    if (!getWhitelist().has(normSymbol)) {
-      console.warn(`❌ Rejected order — Symbol not in whitelist: ${symbol} (${normSymbol})`);
-      return res.status(400).json({ status: "error", error: `Symbol not supported: ${symbol}` });
+    if (!getWhitelist().has(normSymbol))
+      return res.status(400).json({ error: "SYMBOL_NOT_SUPPORTED" });
+
+    const contract = getContracts()[normSymbol];
+    if (!contract)
+      return res.status(400).json({ error: "CONTRACT_META_NOT_FOUND" });
+
+    // ===== Trading hours check =====
+    const nowUTC = new Date();
+    const hoursUTC = nowUTC.getUTCHours() + nowUTC.getUTCMinutes() / 60;
+    if (contract.tradingHours) {
+      const { start, end } = contract.tradingHours;
+      if (hoursUTC < start || hoursUTC > end)
+        return res.status(400).json({ error: "MARKET_CLOSED" });
     }
 
-    // ===== Build the order object for matchingEngine =====
+    // ===== Lot size check =====
+    if (quantity < contract.minQty || quantity % contract.qtyStep !== 0)
+      return res.status(400).json({ error: "INVALID_LOT_SIZE" });
+
+    // ===== Risk engine pre-trade check =====
+    const riskCheck = await preTradeRiskCheck(account_id, normSymbol, quantity);
+    if (!riskCheck.ok)
+      return res.status(400).json({ error: riskCheck.error });
+
+    // ===== Idempotency check (prevent accidental double orders) =====
+    if (idempotency_key) {
+      const { data: existingOrder } = await supabase
+        .from("trades")
+        .select("id, created_at")
+        .eq("idempotency_key", idempotency_key)
+        .single();
+      if (existingOrder) {
+        const createdTime = new Date(existingOrder.created_at).getTime();
+        if (Date.now() - createdTime < 5000) {
+          console.warn(`⚠ Duplicate order detected for idempotency_key ${idempotency_key}`);
+          return res.status(200).json({
+            status: "duplicate",
+            message: "Order already processed",
+            order_id: existingOrder.id
+          });
+        }
+      }
+    }
+
+    // ===== Build order object =====
     const order = {
       id: uuidv4(),
       user_id,
@@ -59,8 +105,8 @@ router.post("/place-order", async (req, res) => {
       side: side.toLowerCase(),
       size: Number(quantity),
       type: order_type.toLowerCase(),
-      sl: stop_loss ? Number(stop_loss) : null,
-      tp: take_profit ? Number(take_profit) : null,
+      stop_loss: stop_loss ? Number(stop_loss) : null,
+      take_profit: take_profit ? Number(take_profit) : null,
       limit_price: limit_price ? Number(limit_price) : null,
       entry_price: null,
       created_at: new Date().toISOString(),
@@ -69,6 +115,8 @@ router.post("/place-order", async (req, res) => {
 
     // ===== Pass to matchingEngine =====
     await placeOrder(order);
+
+    console.log(`✅ Order accepted: ${order.id} (${order.type.toUpperCase()} ${order.size} ${order.symbol})`);
 
     return res.json({
       status: "success",
@@ -81,7 +129,7 @@ router.post("/place-order", async (req, res) => {
 
   } catch (err) {
     console.error("❌ Error in /place-order:", err);
-    return res.status(500).json({ status: "error", error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 });
 
