@@ -1,6 +1,5 @@
 // backend/symbolMap.js — unified mapping for backend
-
-const { supabaseClient } = require("./supabaseClient"); // service role client if needed
+const { supabaseClient } = require("./supabaseClient"); // service role client
 
 // ✅ Local contract meta (fallback if DB not loaded yet)
 const CONTRACTS = {
@@ -12,7 +11,7 @@ const CONTRACTS = {
     tickValue: 50,
     convertToINR: true,
     maxLots: { Evaluation: 20, Funded: 50 },
-    tradingHours: { start: 3.5, end: 10.5 },
+    tradingHours: { start: 3.5, end: 10.5 }, // IST hours
     dailyLossLimit: 100000,
     commission: 50,
     spread: 0.5,
@@ -74,26 +73,28 @@ const CONTRACTS = {
 // ✅ Feed + alias map for backend
 const FEED_SYMBOL_MAP = {
   "NSE:NIFTY": "NIFTY",
-  "NSENIFTY": "NIFTY",
+  NSENIFTY: "NIFTY",
   "NSE:BANKNIFTY": "BANKNIFTY",
-  "NSEBANKNIFTY": "BANKNIFTY",
+  NSEBANKNIFTY: "BANKNIFTY",
   "FX:USDINR": "USDINR",
-  "FXUSDINR": "USDINR",
+  FXUSDINR: "USDINR",
   "FX:EURUSD": "EURUSD",
-  "FXEURUSD": "EURUSD",
+  FXEURUSD: "EURUSD",
   "BINANCE:BTCUSDT": "BINANCE:BTCUSDT",
-  "BINANCEBTCUSDT": "BINANCE:BTCUSDT",
+  BINANCEBTCUSDT: "BINANCE:BTCUSDT",
 
-  // UI aliases
+  // UI aliases & typos
   NIFTY: "NIFTY",
   BANKNIFTY: "BANKNIFTY",
   USDINR: "USDINR",
   EURUSD: "EURUSD",
-  BTCUSD: "BINANCE:BTCUSDT", // important for frontend alias
+  BTCUSD: "BINANCE:BTCUSDT",
+  BTC: "BINANCE:BTCUSDT",
+  XAUUSD: "GOLD", // if you add gold later
 };
 
 /**
- * Normalize any symbol to internal CONTRACTS key
+ * Normalize any incoming symbol to internal CONTRACTS key
  */
 function normalizeSymbol(symbol) {
   if (!symbol) return "";
@@ -112,6 +113,18 @@ function getContracts() {
 }
 
 /**
+ * Check if a given symbol is tradable at the current time
+ */
+function isWithinTradingHours(symbol, now = new Date()) {
+  const key = normalizeSymbol(symbol);
+  const contract = CONTRACTS[key];
+  if (!contract?.tradingHours) return true; // default to tradable if no hours set
+
+  const utcHours = now.getUTCHours() + now.getUTCMinutes() / 60;
+  return utcHours >= contract.tradingHours.start && utcHours <= contract.tradingHours.end;
+}
+
+/**
  * Load all active instruments from Supabase into CONTRACTS
  */
 async function loadContractsFromDB() {
@@ -126,18 +139,23 @@ async function loadContractsFromDB() {
   }
 
   data.forEach((inst) => {
-    CONTRACTS[inst.code] = {
-      qtyStep: inst.qty_step,
-      minQty: inst.min_qty,
-      priceKey: inst.price_key,
-      display: inst.display_name,
-      tickValue: inst.tick_value,
-      convertToINR: inst.convert_to_inr,
-      maxLots: inst.max_lots || {},
-      tradingHours: inst.trading_hours || null,
-      dailyLossLimit: inst.daily_loss_limit,
-      commission: inst.commission,
-      spread: inst.spread,
+    const key = inst.code.toUpperCase();
+    if (CONTRACTS[key]) {
+      console.warn(`⚠ Overwriting default contract for ${key} with DB values`);
+    }
+    CONTRACTS[key] = {
+      ...CONTRACTS[key], // keep defaults for missing fields
+      qtyStep: inst.qty_step ?? CONTRACTS[key]?.qtyStep,
+      minQty: inst.min_qty ?? CONTRACTS[key]?.minQty,
+      priceKey: inst.price_key ?? CONTRACTS[key]?.priceKey,
+      display: inst.display_name ?? CONTRACTS[key]?.display,
+      tickValue: inst.tick_value ?? CONTRACTS[key]?.tickValue,
+      convertToINR: inst.convert_to_inr ?? CONTRACTS[key]?.convertToINR,
+      maxLots: inst.max_lots || CONTRACTS[key]?.maxLots || {},
+      tradingHours: inst.trading_hours || CONTRACTS[key]?.tradingHours || null,
+      dailyLossLimit: inst.daily_loss_limit ?? CONTRACTS[key]?.dailyLossLimit,
+      commission: inst.commission ?? CONTRACTS[key]?.commission,
+      spread: inst.spread ?? CONTRACTS[key]?.spread,
     };
   });
 
@@ -148,4 +166,5 @@ module.exports = {
   normalizeSymbol,
   getContracts,
   loadContractsFromDB,
+  isWithinTradingHours,
 };

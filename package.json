@@ -15,9 +15,12 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.54.0",
     "cors": "^2.8.5",
+    "dayjs": "^1.11.13",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "node-fetch": "^2.7.0",
+    "timezone": "^1.0.23",
+    "utc": "^0.1.0",
     "uuid": "^11.1.0",
     "ws": "^8.18.3"
   },
