@@ -6,7 +6,7 @@ const WebSocket = require("ws");
 const cors = require("cors");
 const fetch = require("node-fetch");
 const url = require("url");
-const Redis = require("ioredis");
+const { Redis } = require("@upstash/redis"); // ✅ Upstash REST client
 const dayjs = require("dayjs");
 const utc = require("dayjs/plugin/utc");
 const timezone = require("dayjs/plugin/timezone");
@@ -28,8 +28,10 @@ const { WHITELIST, addTick, getTicks } = require("./state");
 
 // ===== CONFIG =====
 const PORT = process.env.PORT || 4000;
-const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
-const redis = new Redis(redisUrl);
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
 
 const TICK_HISTORY_LIMIT = 1000;
 const MAX_BROADCAST_TPS = 20;
