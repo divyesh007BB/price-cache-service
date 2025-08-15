@@ -1,4 +1,4 @@
-// index.js — Production Price Server (BTC only, Render-ready)
+// index.js — Production Price Server (BTC only, Render-ready, Fixed Key Issue)
 
 require("dotenv").config();
 const express = require("express");
@@ -31,7 +31,6 @@ const FLUSH_INTERVAL_MS = 200;
 const HISTORY_INTERVAL_MS = 1000;
 
 // ===== Instruments =====
-// ✅ Only BTCUSDT feed
 WHITELIST.clear();
 WHITELIST.add("BTCUSD");
 
@@ -95,7 +94,7 @@ async function getRecentTicks(symbol, limit = 50) {
 
 // ===== Price Publish =====
 function publishPrice(symbol, price) {
-  const normSymbol = normalizeSymbol(symbol);
+  const normSymbol = normalizeSymbol(symbol); // e.g., BTCUSDT -> BTCUSD
   const ts = Date.now();
 
   if (lastPriceSent[normSymbol] === price) return;
@@ -117,7 +116,6 @@ function startFeeds() {
 
 function startBinanceFeed(pair, attempt = 1) {
   const wsUrl = `wss://stream.binance.com:9443/ws/${pair.toLowerCase()}@trade`;
-  const symbolKey = `BINANCE:${pair}`;
   const ws = new WebSocket(wsUrl);
 
   ws.on("open", () => {
@@ -128,7 +126,7 @@ function startBinanceFeed(pair, attempt = 1) {
   ws.on("message", (msg) => {
     try {
       const data = JSON.parse(msg);
-      if (data?.p) publishPrice(symbolKey, parseFloat(data.p));
+      if (data?.p) publishPrice(pair, parseFloat(data.p)); // ✅ pass raw pair so normalizeSymbol fixes it
     } catch (err) {
       logEvent("ERR", `${pair} parse error`, err.message);
     }
@@ -159,7 +157,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ===== HTTP Route for Latest Prices =====
+// HTTP route to get prices
 app.get("/prices", async (req, res) => {
   try {
     const symbols = Array.from(WHITELIST);
