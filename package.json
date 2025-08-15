@@ -4,6 +4,7 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
+    "start": "node backend/price-server/index.js",
     "start:price-server": "node backend/price-server/index.js",
     "start:matching-engine": "node backend/matching-engine/matchingEngine.js",
     "dev:price-server": "nodemon backend/price-server/index.js",

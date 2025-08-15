@@ -1,4 +1,4 @@
-// index.js — Production Prop Firm Price Server (Connected to Matching Engine)
+// index.js — Production Price Server (BTC only, Render-ready)
 
 require("dotenv").config();
 const express = require("express");
@@ -13,21 +13,13 @@ dayjs.extend(utc);
 dayjs.extend(timezone);
 
 // ===== Shared Imports =====
-const { normalizeSymbol, getContracts, CONTRACTS } = require("../shared/symbolMap");
+const { normalizeSymbol, CONTRACTS } = require("../shared/symbolMap");
 const { WHITELIST, addTick, getTicks } = require("../shared/state");
 
 // ===== CONFIG =====
 const PORT = process.env.PORT || 4000;
-const redisUrl = process.env.REDIS_URL || process.env.UPSTASH_REDIS_REST_URL;
-const redis = new Redis(
-  redisUrl,
-  process.env.UPSTASH_REDIS_REST_TOKEN
-    ? {
-        password: process.env.UPSTASH_REDIS_REST_TOKEN,
-        tls: redisUrl.startsWith("rediss://") ? {} : undefined,
-      }
-    : {}
-);
+const redisUrl = process.env.REDIS_URL;
+const redis = new Redis(redisUrl);
 
 const TICK_HISTORY_LIMIT = 1000;
 const MAX_BROADCAST_TPS = 20;
@@ -39,13 +31,12 @@ const FLUSH_INTERVAL_MS = 200;
 const HISTORY_INTERVAL_MS = 1000;
 
 // ===== Instruments =====
+// ✅ Only BTCUSDT feed
 WHITELIST.clear();
-Object.keys(CONTRACTS).forEach((symbol) => WHITELIST.add(symbol));
+WHITELIST.add("BTCUSD");
 
-// Auto-detect Binance pairs
-const BINANCE_PAIRS = Object.values(CONTRACTS)
-  .filter((c) => c.priceKey?.startsWith("BINANCE:"))
-  .map((c) => c.priceKey.split(":")[1]);
+// Binance pair mapping for BTC only
+const BINANCE_PAIRS = ["BTCUSDT"];
 
 // ===== Logging =====
 function logEvent(type, msg, extra) {
@@ -107,7 +98,7 @@ function publishPrice(symbol, price) {
   const normSymbol = normalizeSymbol(symbol);
   const ts = Date.now();
 
-  if (lastPriceSent[normSymbol] === price) return; // skip duplicate ticks
+  if (lastPriceSent[normSymbol] === price) return;
   lastPriceSent[normSymbol] = price;
 
   bufferPrice(normSymbol, price, ts);
