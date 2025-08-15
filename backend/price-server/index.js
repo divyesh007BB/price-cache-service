@@ -1,4 +1,4 @@
-// index.js — Production Price Server (BTC only, Render-ready, Fixed Key Issue)
+// index.js — Production Price Server (BTC only, Render-ready, Fixed Key Issue + Bootstrap Price)
 
 require("dotenv").config();
 const express = require("express");
@@ -7,6 +7,7 @@ const cors = require("cors");
 const url = require("url");
 const Redis = require("ioredis");
 const dayjs = require("dayjs");
+const fetch = require("node-fetch"); // ✅ Needed for REST bootstrap
 const utc = require("dayjs/plugin/utc");
 const timezone = require("dayjs/plugin/timezone");
 dayjs.extend(utc);
@@ -108,6 +109,23 @@ function publishPrice(symbol, price) {
   redis.publish("prices", JSON.stringify({ symbol: normSymbol, price, ts }));
 }
 
+// ===== Bootstrap Price =====
+async function bootstrapPrice() {
+  try {
+    const res = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT");
+    const data = await res.json();
+    if (data?.price) {
+      const price = parseFloat(data.price);
+      logEvent("BOOT", `Fetched bootstrap price BTCUSD = ${price}`);
+      publishPrice("BTCUSDT", price);
+    } else {
+      logEvent("WARN", "Bootstrap price fetch returned no price");
+    }
+  } catch (err) {
+    logEvent("ERR", "Failed to fetch bootstrap price", err.message);
+  }
+}
+
 // ===== Feeds =====
 function startFeeds() {
   BINANCE_PAIRS.forEach(startBinanceFeed);
@@ -182,9 +200,10 @@ function broadcast(msg) {
   }
 }
 
-// ✅ FIX: Listen on all interfaces
+// ✅ Listen on all interfaces
 const server = app.listen(PORT, "0.0.0.0", async () => {
   logEvent("START", `Price Server running on port ${PORT} (listening on all interfaces)`);
+  await bootstrapPrice(); // ✅ Fetch initial price before live feed
   startFeeds();
 });
 
