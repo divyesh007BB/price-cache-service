@@ -1,6 +1,6 @@
 // feedControl.js — centralizes WS subscription control (no circular deps)
 const WebSocket = require("ws");
-const { getContracts } = require("./symbolMap");
+const { getContracts } = require("../shared/symbolMap"); // ✅ fixed path
 
 let ws = null;
 

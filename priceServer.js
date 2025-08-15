@@ -1,86 +1,56 @@
-// backend/priceServer.js — Lean Feed for NIFTY + BTC only
+// backend/priceServer.js — Lean Binance feed (multi-symbol, free)
 
 require("dotenv").config();
 const WebSocket = require("ws");
-const fetch = require("node-fetch");
-
-const { priceCache, WHITELIST } = require("./state");
-const { normalizeSymbol } = require("./symbolMap");
-const { processTick } = require("./matchingEngine");
+const { priceCache, WHITELIST, addTick } = require("./backend/state");
+const { normalizeSymbol } = require("./backend/symbolMap");
+const { processTick } = require("./backend/matchingEngine");
 
 // ===== CONFIG =====
-const YAHOO_MAP = { "NSE:NIFTY": "^NSEI" };
-const YAHOO_INTERVAL_MS = 60_000; // Yahoo free ~1min update
-const BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade";
+const BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream?streams=";
 
-// ===== INIT =====
-WHITELIST.add("NIFTY");
-WHITELIST.add("BINANCE:BTCUSDT");
+// ===== INIT WHITELIST =====
+WHITELIST.clear();
+WHITELIST.add("BINANCE:BTCUSDT"); // ✅ Start BTC only
+// later: WHITELIST.add("BINANCE:XAUUSDT"), WHITELIST.add("BINANCE:ETHUSDT"), etc.
 
 function startFeed() {
-  startYahooNifty();
-  startBinanceBTC();
-  console.log("✅ Lean price feed started (NIFTY + BTC only)");
-}
+  const streams = Array.from(WHITELIST)
+    .filter((s) => s.startsWith("BINANCE:"))
+    .map((s) => `${s.split(":")[1].toLowerCase()}@trade`)
+    .join("/");
 
-// ===== YAHOO FINANCE (NIFTY) =====
-async function fetchYahooPrice(yahooSymbol) {
-  try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?interval=1m`;
-    const res = await fetch(url);
-    const data = await res.json();
-    return data?.chart?.result?.[0]?.meta?.regularMarketPrice ?? null;
-  } catch (err) {
-    console.error(`❌ Yahoo fetch fail for ${yahooSymbol}:`, err.message);
-    return null;
-  }
-}
-
-function startYahooNifty() {
-  const yahooSymbol = YAHOO_MAP["NSE:NIFTY"];
-  if (!yahooSymbol) return console.error("❌ No Yahoo mapping for NIFTY");
-
-  const poll = async () => {
-    const price = await fetchYahooPrice(yahooSymbol);
-    if (price) {
-      const symbol = "NIFTY";
-      priceCache.set(symbol, { price, ts: Date.now() });
-      processTick(symbol, price);
-    }
-  };
-
-  poll();
-  setInterval(poll, YAHOO_INTERVAL_MS);
-}
-
-// ===== BINANCE (BTC) =====
-function startBinanceBTC() {
-  const ws = new WebSocket(BINANCE_WS_URL);
+  const wsUrl = BINANCE_WS_BASE + streams;
+  const ws = new WebSocket(wsUrl);
 
   ws.on("open", () => {
-    console.log("🔗 Binance BTC feed connected");
+    console.log(`🔗 Binance feed connected for: ${Array.from(WHITELIST).join(", ")}`);
   });
 
   ws.on("message", (msg) => {
     try {
-      const data = JSON.parse(msg);
-      if (!data.p) return;
-      const price = parseFloat(data.p);
-      const symbol = "BINANCE:BTCUSDT";
+      const parsed = JSON.parse(msg);
+      const stream = parsed.stream;
+      const price = parseFloat(parsed.data.p);
+      if (!price) return;
+
+      const binanceSymbol = stream.split("@")[0].toUpperCase();
+      const symbol = `BINANCE:${binanceSymbol}`;
       priceCache.set(symbol, { price, ts: Date.now() });
+      addTick(symbol, price);
       processTick(symbol, price);
     } catch (err) {
-      console.error("❌ Binance BTC parse error:", err.message);
+      console.error("❌ Binance parse error:", err.message);
     }
   });
 
   ws.on("close", () => {
-    console.warn("⚠ Binance BTC feed closed, reconnecting in 5s...");
-    setTimeout(startBinanceBTC, 5000);
+    console.warn("⚠ Binance feed closed, reconnecting in 5s...");
+    setTimeout(startFeed, 5000);
   });
 
   ws.on("error", (err) => {
-    console.error("❌ Binance BTC feed error:", err.message);
+    console.error("❌ Binance feed error:", err.message);
     ws.close();
   });
 }

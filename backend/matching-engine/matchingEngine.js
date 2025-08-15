@@ -1,28 +1,29 @@
-// matchingEngine.js — Real Prop Firm Execution Engine (NIFTY + BTC version, Redis-powered)
+// matchingEngine.js — Real Prop Firm Execution Engine (KeyDB/Redis Ready)
 
 require("dotenv").config();
-const { createClient } = require("@supabase/supabase-js");
 const { v4: uuidv4 } = require("uuid");
 const fetch = require("node-fetch");
-const { normalizeSymbol, getContracts, loadContractsFromDB } = require("./symbolMap");
-const { addTick } = require("./state");
+const Redis = require("ioredis"); // ✅ TCP Redis client for self-hosted Redis/KeyDB
+
+// Connect to local/compose KeyDB or Redis
+const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
+
+const { normalizeSymbol, getContracts, loadContractsFromDB } = require("../shared/symbolMap");
+const { addTick } = require("../shared/state");
 const { markSymbolActive, markSymbolInactive } = require("./feedControl");
-const Redis = require("ioredis");
+const { supabaseClient: supabase } = require("../shared/supabaseClient");
 
-const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379");
-
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-
-// ===== STATE =====
+// ---------- Local State ----------
 let wsBroadcast = () => {};
 let accounts = new Map();
 let pendingOrders = [];
 let openTrades = [];
 let sessionPnL = new Map();
 let recentOrders = new Set();
-let accountLocks = new Map(); // account_id -> Promise lock
+let accountLocks = new Map();
+const latestPrices = {}; // ✅ live in-memory price cache
 
-// ===== SETTINGS =====
+// ---------- Constants ----------
 const EXECUTION_LATENCY_MS = 150;
 const SLTP_GRACE_MS = 1000;
 const ENABLE_PARTIAL_FILLS = false;
@@ -30,23 +31,43 @@ const PARTIAL_FILL_RATIO = 0.5;
 const PRICE_STALE_MS = 3000;
 const DUPLICATE_ORDER_MS = 500;
 
-// ===== INIT =====
+// ---------- Helpers ----------
+const safeParse = (raw) => {
+  try {
+    if (raw == null) return null;
+    if (typeof raw === "string") return JSON.parse(raw);
+    if (typeof raw === "object") return raw;
+    return null;
+  } catch {
+    return null;
+  }
+};
+
+function todayStr() {
+  return new Date().toISOString().split("T")[0];
+}
+
+// ===================================
+// INIT
+// ===================================
 async function loadInitialData() {
   console.log("📦 Loading initial data from Supabase...");
   await loadContractsFromDB();
 
+  // Load accounts
   const { data: accData, error: accErr } = await supabase.from("accounts").select("*");
   if (accErr) throw accErr;
-  accData.forEach(acc => {
+  accData.forEach((acc) => {
     accounts.set(acc.id, acc);
     sessionPnL.set(acc.id, {
       day: todayStr(),
       realized: 0,
       bestDay: acc.best_day_profit ?? 0,
-      total: acc.total_profit ?? 0
+      total: acc.total_profit ?? 0,
     });
   });
 
+  // Load pending orders
   const { data: poData, error: poErr } = await supabase
     .from("orders")
     .select("*")
@@ -54,12 +75,27 @@ async function loadInitialData() {
   if (poErr) throw poErr;
   pendingOrders = poData || [];
 
+  // Load open trades
   const { data: otData, error: otErr } = await supabase
     .from("trades")
     .select("*")
     .eq("is_open", true);
   if (otErr) throw otErr;
   openTrades = otData || [];
+
+  // Load initial prices from Redis/KeyDB
+  try {
+    const all = await redis.hgetall("latest_prices");
+    for (const [symbol, val] of Object.entries(all)) {
+      latestPrices[symbol] = JSON.parse(val);
+    }
+    console.log(`✅ Loaded ${Object.keys(latestPrices).length} prices from Redis/KeyDB`);
+  } catch (err) {
+    console.error("❌ Failed to load initial prices from Redis/KeyDB", err);
+  }
+
+  // Subscribe to price updates
+  subscribePriceFeed();
 
   console.log(
     `✅ Loaded ${accounts.size} accounts, ${pendingOrders.length} pending orders, ${openTrades.length} open trades`
@@ -80,22 +116,34 @@ function broadcastSnapshot() {
   });
 }
 
-function todayStr() {
-  return new Date().toISOString().split("T")[0];
+// ===================================
+// PRICE SUBSCRIPTION
+// ===================================
+async function subscribePriceFeed() {
+  const sub = redis.duplicate();
+  await sub.subscribe("prices");
+  sub.on("message", (channel, message) => {
+    if (channel === "prices") {
+      const { symbol, price, ts } = JSON.parse(message);
+      latestPrices[symbol] = { price, ts };
+    }
+  });
+  console.log("📡 Subscribed to Redis/KeyDB 'prices' channel");
 }
 
-// ===== PRICE FETCH (NIFTY + BTC only) =====
+// ===================================
+// FETCH PRICE NOW (fallback only)
+// ===================================
 async function fetchPriceNow(symbol) {
   const contracts = getContracts();
   const meta = contracts[symbol];
   if (!meta) return null;
 
   let price = null;
-
   try {
     const vendorSymbol = meta.priceKey || symbol;
+
     if (vendorSymbol.startsWith("NSE:")) {
-      // ✅ Yahoo Finance for NIFTY
       const yahooMap = { "NSE:NIFTY": "^NSEI" };
       const yahooSymbol = yahooMap[vendorSymbol];
       if (!yahooSymbol) return null;
@@ -104,15 +152,15 @@ async function fetchPriceNow(symbol) {
       );
       const data = await res.json();
       price = data?.chart?.result?.[0]?.meta?.regularMarketPrice ?? null;
-    } else if (vendorSymbol === "BINANCE:BTCUSDT") {
-      // ✅ Binance REST for BTC
-      const res = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT");
+    } else if (vendorSymbol.startsWith("BINANCE:")) {
+      const binancePair = vendorSymbol.replace("BINANCE:", "").toUpperCase();
+      const res = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${binancePair}`);
       const data = await res.json();
-      price = parseFloat(data.price);
+      if (data?.price) price = parseFloat(data.price);
     }
 
     if (price && price > 0) {
-      await redis.set(`price:${symbol}`, JSON.stringify({ price, ts: Date.now() }));
+      latestPrices[symbol] = { price, ts: Date.now() };
       addTick(symbol, price, Date.now());
       return price;
     }
@@ -122,18 +170,19 @@ async function fetchPriceNow(symbol) {
   return null;
 }
 
-// ===== PRICE TICK PROCESS =====
+// ===================================
+// PROCESS TICK
+// ===================================
 async function processTick(symbol, price) {
   const normSymbol = normalizeSymbol(symbol);
-
-  await redis.set(`price:${normSymbol}`, JSON.stringify({ price, ts: Date.now() }));
-  addTick(normSymbol, price, Date.now()); // ✅ push into history buffer
+  latestPrices[normSymbol] = { price, ts: Date.now() };
+  addTick(normSymbol, price, Date.now());
   wsBroadcast({ type: "price", symbol: normSymbol, price, ts: Date.now() });
 
-  // Unrealized PnL updates
+  // Update uPnL
   openTrades
-    .filter(t => t.symbol === normSymbol)
-    .forEach(t => {
+    .filter((t) => t.symbol === normSymbol)
+    .forEach((t) => {
       const tickValue = getContracts()[t.symbol]?.tickValue ?? 1;
       const upnl =
         t.side === "buy"
@@ -142,17 +191,17 @@ async function processTick(symbol, price) {
       wsBroadcast({ type: "trade_upnl", trade_id: t.id, upnl });
     });
 
-  // Limit fills
+  // Fill limit orders
   const toFill = pendingOrders.filter(
-    o =>
+    (o) =>
       o.symbol === normSymbol &&
       ((o.side === "buy" && price <= o.limit_price) ||
         (o.side === "sell" && price >= o.limit_price))
   );
   for (const order of toFill) await fillOrder(order, price);
 
-  // SL/TP closes
-  const toClose = openTrades.filter(t => {
+  // Auto-close SL/TP
+  const toClose = openTrades.filter((t) => {
     if (t.symbol !== normSymbol) return false;
     if (Date.now() - new Date(t.time_opened).getTime() < SLTP_GRACE_MS) return false;
     if (t.side === "buy") {
@@ -170,7 +219,9 @@ async function processTick(symbol, price) {
   for (const trade of toClose) await closeTrade(trade, price);
 }
 
-// ===== CENTRAL RISK CHECK =====
+// ===================================
+// RISK (pre-trade)
+// ===================================
 async function preTradeRiskCheck(order, account) {
   if (!account) return { ok: false, reason: "ACCOUNT_NOT_FOUND" };
   if (account.status === "blown" || account.status === "paused")
@@ -195,7 +246,9 @@ async function preTradeRiskCheck(order, account) {
   return { ok: true };
 }
 
-// ===== PLACE ORDER =====
+// ===================================
+// PLACE ORDER
+// ===================================
 async function placeOrder(order) {
   order.symbol = normalizeSymbol(order.symbol);
 
@@ -211,9 +264,7 @@ async function placeOrder(order) {
   markSymbolActive(order.symbol);
 
   if (order.type === "market") {
-    let cachedData = await redis.get(`price:${order.symbol}`);
-    let cached = cachedData ? JSON.parse(cachedData) : null;
-
+    let cached = latestPrices[order.symbol];
     if (!cached?.price || Date.now() - cached.ts > PRICE_STALE_MS) {
       const live = await fetchPriceNow(order.symbol);
       if (live) cached = { price: live, ts: Date.now() };
@@ -233,7 +284,9 @@ async function placeOrder(order) {
   }
 }
 
-// ===== FILL ORDER =====
+// ===================================
+// FILL ORDER
+// ===================================
 async function fillOrder(order, basePrice) {
   const lock = accountLocks.get(order.account_id) || Promise.resolve();
   accountLocks.set(
@@ -244,6 +297,7 @@ async function fillOrder(order, basePrice) {
         const spread = contract?.spread || 0;
         const commission = contract?.commission || 0;
         const slippage = contract?.slippage || 0;
+
         const execPrice =
           order.side === "buy"
             ? basePrice + spread + slippage
@@ -269,7 +323,7 @@ async function fillOrder(order, basePrice) {
           pnl: -commission * sizeToFill,
         };
 
-        pendingOrders = pendingOrders.filter(o => o.id !== order.id);
+        pendingOrders = pendingOrders.filter((o) => o.id !== order.id);
         openTrades.push(trade);
         markSymbolActive(order.symbol);
         wsBroadcast({ type: "trade_fill", trade });
@@ -292,7 +346,9 @@ async function fillOrder(order, basePrice) {
   );
 }
 
-// ===== CLOSE TRADE =====
+// ===================================
+// CLOSE TRADE
+// ===================================
 async function closeTrade(trade, closePrice) {
   const tickValue = getContracts()[trade.symbol]?.tickValue ?? 1;
   const pnl =
@@ -310,7 +366,7 @@ async function closeTrade(trade, closePrice) {
     pnl: netPnL,
   };
 
-  openTrades = openTrades.filter(t => t.id !== trade.id);
+  openTrades = openTrades.filter((t) => t.id !== trade.id);
   wsBroadcast({ type: "trade_close", trade: closedTrade });
   broadcastSnapshot();
   await supabase.from("trades").update(closedTrade).eq("id", trade.id);
@@ -349,14 +405,16 @@ async function closeTrade(trade, closePrice) {
   }
 
   const stillActive =
-    pendingOrders.some(o => o.symbol === trade.symbol) ||
-    openTrades.some(t => t.symbol === trade.symbol);
+    pendingOrders.some((o) => o.symbol === trade.symbol) ||
+    openTrades.some((t) => t.symbol === trade.symbol);
   if (!stillActive) markSymbolInactive(trade.symbol);
 
   await auditLog("TRADE_CLOSED", { trade: closedTrade });
 }
 
-// ===== HELPERS =====
+// ===================================
+// OTHER HELPERS
+// ===================================
 async function breachesLossLimits(account) {
   const sess = sessionPnL.get(account.id);
   if (!sess) return false;
@@ -373,7 +431,7 @@ async function checkMIL(acc, price) {
       .from("accounts")
       .update({ status: "blown", breach_reason: "MAX_INTRADAY_LOSS" })
       .eq("id", acc.id);
-    for (const pos of openTrades.filter(p => p.account_id === acc.id)) {
+    for (const pos of openTrades.filter((p) => p.account_id === acc.id)) {
       await closeTrade(pos, price);
     }
   }
@@ -413,8 +471,8 @@ async function auditLog(event, payload) {
 async function convertPrice(symbol, price) {
   const meta = getContracts()[symbol];
   if (meta?.convertToINR) {
-    const usdInrRaw = await redis.get("price:USDINR");
-    const usdInr = usdInrRaw ? JSON.parse(usdInrRaw).price : 83;
+    const usdInrRaw = latestPrices["USDINR"] || safeParse(await redis.get("price:USDINR"));
+    const usdInr = usdInrRaw?.price ?? 83;
     return price * usdInr;
   }
   return price;
@@ -429,20 +487,22 @@ function withinTradingHours(symbol) {
   return hours >= contract.tradingHours.start && hours <= contract.tradingHours.end;
 }
 
-// ===== GETTERS =====
+// ===================================
+// GETTERS
+// ===================================
 function getOpenTrades() {
   return openTrades;
 }
-
 function getAccounts() {
   return Array.from(accounts.values());
 }
-
 function getPendingOrders() {
   return pendingOrders;
 }
 
-// ===== EXPORTS =====
+// ===================================
+// EXPORTS
+// ===================================
 module.exports = {
   loadInitialData,
   setBroadcaster,

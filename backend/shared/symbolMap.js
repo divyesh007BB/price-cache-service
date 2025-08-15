@@ -1,7 +1,7 @@
-// backend/symbolMap.js — restricted to NIFTY + BTC for launch
-const { supabaseClient } = require("./supabaseClient"); // service role client
+// symbolMap.js — Phase 1: NIFTY + Binance BTC, Gold, EUR, GBP
+const { supabaseClient } = require("./supabaseClient"); // ✅ service role client
 
-// ✅ Local contract meta (only NIFTY + BTC)
+// ✅ Local contract meta (defaults)
 const CONTRACTS = {
   NIFTY: {
     qtyStep: 1,
@@ -29,6 +29,45 @@ const CONTRACTS = {
     commission: 50,
     spread: 5,
   },
+  "BINANCE:XAUUSDT": {
+    qtyStep: 0.01,
+    minQty: 0.01,
+    priceKey: "BINANCE:XAUUSDT",
+    display: "Gold (XAU/USD)",
+    tickValue: 1,
+    convertToINR: false,
+    maxLots: { Evaluation: 5, Funded: 10 },
+    tradingHours: { start: 0, end: 24 },
+    dailyLossLimit: 100000,
+    commission: 30,
+    spread: 0.5,
+  },
+  "BINANCE:EURUSDT": {
+    qtyStep: 0.001,
+    minQty: 0.001,
+    priceKey: "BINANCE:EURUSDT",
+    display: "Euro (EUR/USD)",
+    tickValue: 1,
+    convertToINR: false,
+    maxLots: { Evaluation: 5, Funded: 10 },
+    tradingHours: { start: 0, end: 24 },
+    dailyLossLimit: 100000,
+    commission: 20,
+    spread: 0.0001,
+  },
+  "BINANCE:GBPUSDT": {
+    qtyStep: 0.001,
+    minQty: 0.001,
+    priceKey: "BINANCE:GBPUSDT",
+    display: "British Pound (GBP/USD)",
+    tickValue: 1,
+    convertToINR: false,
+    maxLots: { Evaluation: 5, Funded: 10 },
+    tradingHours: { start: 0, end: 24 },
+    dailyLossLimit: 100000,
+    commission: 20,
+    spread: 0.0001,
+  },
 };
 
 // ✅ Feed + alias map
@@ -41,6 +80,19 @@ const FEED_SYMBOL_MAP = {
   BINANCEBTCUSDT: "BINANCE:BTCUSDT",
   BTCUSD: "BINANCE:BTCUSDT",
   BTC: "BINANCE:BTCUSDT",
+
+  "BINANCE:XAUUSDT": "BINANCE:XAUUSDT",
+  BINANCEXAUUSDT: "BINANCE:XAUUSDT",
+  XAUUSD: "BINANCE:XAUUSDT",
+  GOLD: "BINANCE:XAUUSDT",
+
+  "BINANCE:EURUSDT": "BINANCE:EURUSDT",
+  BINANCEEURUSDT: "BINANCE:EURUSDT",
+  EURUSD: "BINANCE:EURUSDT",
+
+  "BINANCE:GBPUSDT": "BINANCE:GBPUSDT",
+  BINANCEGBPUSDT: "BINANCE:GBPUSDT",
+  GBPUSD: "BINANCE:GBPUSDT",
 };
 
 /**
@@ -71,18 +123,20 @@ function isWithinTradingHours(symbol, now = new Date()) {
   if (!contract?.tradingHours) return true; // default to tradable if no hours set
 
   const utcHours = now.getUTCHours() + now.getUTCMinutes() / 60;
-  return utcHours >= contract.tradingHours.start && utcHours <= contract.tradingHours.end;
+  return (
+    utcHours >= contract.tradingHours.start &&
+    utcHours <= contract.tradingHours.end
+  );
 }
 
 /**
  * Load all active instruments from Supabase into CONTRACTS
- * — Will still load only NIFTY and BTC if more exist in DB
  */
 async function loadContractsFromDB() {
   const { data, error } = await supabaseClient
     .from("instruments")
     .select("*")
-    .in("code", ["NIFTY", "BINANCE:BTCUSDT"]) // ✅ only these
+    .in("code", Object.keys(CONTRACTS))
     .eq("is_active", true);
 
   if (error) {
@@ -90,28 +144,37 @@ async function loadContractsFromDB() {
     return;
   }
 
+  if (!data || data.length === 0) {
+    console.warn("⚠ No active instruments found in DB, using defaults");
+    return;
+  }
+
   data.forEach((inst) => {
-    const key = inst.code.toUpperCase();
+    const key = inst.code?.toUpperCase();
+    if (!key) return;
     if (CONTRACTS[key]) {
       console.warn(`⚠ Overwriting default contract for ${key} with DB values`);
     }
     CONTRACTS[key] = {
-      ...CONTRACTS[key], // keep defaults for missing fields
+      ...CONTRACTS[key],
       qtyStep: inst.qty_step ?? CONTRACTS[key]?.qtyStep,
       minQty: inst.min_qty ?? CONTRACTS[key]?.minQty,
       priceKey: inst.price_key ?? CONTRACTS[key]?.priceKey,
       display: inst.display_name ?? CONTRACTS[key]?.display,
       tickValue: inst.tick_value ?? CONTRACTS[key]?.tickValue,
-      convertToINR: inst.convert_to_inr ?? CONTRACTS[key]?.convertToINR,
+      convertToINR:
+        inst.convert_to_inr ?? CONTRACTS[key]?.convertToINR ?? false,
       maxLots: inst.max_lots || CONTRACTS[key]?.maxLots || {},
-      tradingHours: inst.trading_hours || CONTRACTS[key]?.tradingHours || null,
-      dailyLossLimit: inst.daily_loss_limit ?? CONTRACTS[key]?.dailyLossLimit,
+      tradingHours:
+        inst.trading_hours || CONTRACTS[key]?.tradingHours || null,
+      dailyLossLimit:
+        inst.daily_loss_limit ?? CONTRACTS[key]?.dailyLossLimit,
       commission: inst.commission ?? CONTRACTS[key]?.commission,
       spread: inst.spread ?? CONTRACTS[key]?.spread,
     };
   });
 
-  console.log(`✅ Loaded ${data.length} contracts from DB (restricted)`);
+  console.log(`✅ Loaded ${data.length} contracts from DB (Phase 1)`);
 }
 
 module.exports = {
@@ -119,4 +182,5 @@ module.exports = {
   getContracts,
   loadContractsFromDB,
   isWithinTradingHours,
+  CONTRACTS, // ✅ exported for direct access
 };

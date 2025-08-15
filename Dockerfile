@@ -1,20 +1,15 @@
-# Dockerfile — Price Server
-FROM node:18-alpine
+FROM node:20-alpine
 
-# Set working directory
+# Set root working dir
 WORKDIR /app
 
-# Copy package.json and package-lock.json
+# Copy root package files
 COPY package*.json ./
 
-# Install dependencies
-RUN npm install --production
+# Install dependencies once for all services
+RUN npm install --only=production
 
-# Copy rest of the app
-COPY . .
+# Copy backend code
+COPY backend /app/backend
 
-# Expose the port (matches your .env / compose)
-EXPOSE 4000
-
-# Start the server
-CMD ["npm", "start"]
+ENV NODE_ENV=production

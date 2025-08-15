@@ -2,9 +2,9 @@
 
 const express = require("express");
 const router = express.Router();
-const { placeOrder } = require("./matchingEngine");
-const { normalizeSymbol, getContracts } = require("./symbolMap");
-const { WHITELIST } = require("./state");
+const { placeOrder } = require("./matching-engine/matchingEngine");
+const { normalizeSymbol, getContracts } = require("../../shared/symbolMap");
+const { WHITELIST } = require("../../shared/state");
 const { v4: uuidv4 } = require("uuid");
 const { createClient } = require("@supabase/supabase-js");
 const { preTradeRiskCheck } = require("./riskEngine");

@@ -1,27 +1,70 @@
+version: "3.9"
+
 services:
-  redis:
-    image: redis:7-alpine
-    container_name: aroha-redis
+  # ===========================
+  # KeyDB (Redis-compatible)
+  # ===========================
+  keydb:
+    image: eqalpha/keydb:latest
+    container_name: aroha-keydb
     restart: unless-stopped
     ports:
       - "6379:6379"
     volumes:
-      - redis_data:/data
+      - keydb_data:/data
+    command: keydb-server --appendonly yes --save "60 1"
+    networks:
+      - aroha-net
 
+  # ===========================
+  # Price Server
+  # ===========================
   price-server:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: aroha-price-server
     restart: unless-stopped
+    working_dir: /app/backend/price-server
     env_file:
-      - .env
+      - ./backend/price-server/.env
     environment:
       - PORT=4000
-      - NODE_ENV=development
-      - REDIS_URL=redis://redis:6379
+      - NODE_ENV=production
+      - REDIS_URL=redis://keydb:6379
     depends_on:
-      - redis
+      - keydb
     ports:
       - "4000:4000"
+    command: ["node", "index.js"]
+    networks:
+      - aroha-net
+
+  # ===========================
+  # Matching Engine
+  # ===========================
+  matching-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aroha-matching-engine
+    restart: unless-stopped
+    working_dir: /app/backend/matching-engine
+    env_file:
+      - ./backend/matching-engine/.env
+    environment:
+      - NODE_ENV=production
+      - REDIS_URL=redis://keydb:6379
+    depends_on:
+      - keydb
+      - price-server
+    command: ["node", "matchingEngine.js"]
+    networks:
+      - aroha-net
 
 volumes:
-  redis_data:
+  keydb_data:
+
+networks:
+  aroha-net:
+    driver: bridge
