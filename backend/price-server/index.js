@@ -182,8 +182,9 @@ function broadcast(msg) {
   }
 }
 
-const server = app.listen(PORT, async () => {
-  logEvent("START", `Price Server running on port ${PORT}`);
+// ✅ FIX: Listen on all interfaces
+const server = app.listen(PORT, "0.0.0.0", async () => {
+  logEvent("START", `Price Server running on port ${PORT} (listening on all interfaces)`);
   startFeeds();
 });
 
