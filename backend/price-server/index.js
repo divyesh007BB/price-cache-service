@@ -159,6 +159,20 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ===== HTTP Route for Latest Prices =====
+app.get("/prices", async (req, res) => {
+  try {
+    const symbols = Array.from(WHITELIST);
+    const prices = {};
+    for (const sym of symbols) {
+      prices[sym] = await getPrice(sym);
+    }
+    res.json({ success: true, prices });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 const wss = new WebSocket.Server({ noServer: true });
 function heartbeat() {
   this.isAlive = true;
