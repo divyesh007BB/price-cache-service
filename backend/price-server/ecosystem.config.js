@@ -5,6 +5,7 @@ module.exports = {
     {
       name: "price-server",
       script: "index.js",
+      cwd: "backend/price-server",   // ✅ ensure correct working dir
       instances: 1,
       autorestart: true,
       watch: false,
@@ -49,7 +50,7 @@ module.exports = {
     {
       name: "publisher",
       script: "publisher.js",
-      cwd: "backend/price-server", // ✅ ensures it runs inside correct folder
+      cwd: "backend/price-server",   // ✅ run inside correct folder
       instances: 1,
       autorestart: true,
       watch: false,
