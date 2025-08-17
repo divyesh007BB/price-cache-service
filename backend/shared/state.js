@@ -38,6 +38,9 @@ function setWhitelist(symbols = []) {
   });
 }
 
+// ===== Initialize Default Whitelist =====
+setWhitelist(["BTCUSD", "ETHUSD", "XAUUSD"]);
+
 // ===== Exports =====
 module.exports = {
   WHITELIST,

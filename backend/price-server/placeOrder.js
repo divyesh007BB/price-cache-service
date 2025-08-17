@@ -1,10 +1,10 @@
-// placeOrder.js — Prop firm grade validation before matchingEngine execution (Redis-based)
+// placeOrder.js — Gateway API for order validation + persistence (prop firm style)
 
 const express = require("express");
 const router = express.Router();
-const { placeOrder } = require("./matching-engine/matchingEngine");
-const { normalizeSymbol, getContracts } = require("../../shared/symbolMap");
-const { WHITELIST } = require("../../shared/state");
+const { placeOrder } = require("../matching-engine/matchingEngine");
+const { normalizeSymbol, getContracts } = require("../shared/symbolMap");
+const { WHITELIST } = require("../shared/state");
 const { v4: uuidv4 } = require("uuid");
 const { createClient } = require("@supabase/supabase-js");
 const { preTradeRiskCheck } = require("./riskEngine");
@@ -12,7 +12,7 @@ const Redis = require("ioredis");
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
+  process.env.SUPABASE_SERVICE_KEY // ✅ keep consistent with rest of backend
 );
 
 const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379");
@@ -25,11 +25,12 @@ function getWhitelist() {
 }
 
 async function getPriceFromRedis(symbol) {
-  const raw = await redis.get(`price:${symbol}`);
+  const raw = await redis.hget("latest_prices", symbol);
   return raw ? JSON.parse(raw) : null;
 }
 
-router.post("/place-order", async (req, res) => {
+// ===== Route =====
+router.post("/", async (req, res) => {
   try {
     const {
       user_id,
@@ -44,9 +45,9 @@ router.post("/place-order", async (req, res) => {
       idempotency_key
     } = req.body;
 
-    console.log(`📝 Incoming order: ${JSON.stringify(req.body)}`);
+    console.log(`📝 Incoming order: user=${user_id}, acc=${account_id}, sym=${symbol}, type=${order_type}, qty=${quantity}`);
 
-    // ===== Basic input validation =====
+    // ===== Validation =====
     if (!user_id) return res.status(400).json({ error: "Missing user_id" });
     if (!account_id) return res.status(400).json({ error: "Missing account_id" });
     if (!symbol) return res.status(400).json({ error: "Missing symbol" });
@@ -57,7 +58,7 @@ router.post("/place-order", async (req, res) => {
     if (order_type.toLowerCase() === "limit" && !limit_price)
       return res.status(400).json({ error: "Limit orders require limit_price" });
 
-    // ===== Symbol whitelist check =====
+    // ===== Whitelist =====
     const normSymbol = normalizeSymbol(symbol);
     if (!getWhitelist().has(normSymbol))
       return res.status(400).json({ error: "SYMBOL_NOT_SUPPORTED" });
@@ -66,20 +67,21 @@ router.post("/place-order", async (req, res) => {
     if (!contract)
       return res.status(400).json({ error: "CONTRACT_META_NOT_FOUND" });
 
-    // ===== Trading hours check (if applicable) =====
-    const nowUTC = new Date();
-    const hoursUTC = nowUTC.getUTCHours() + nowUTC.getUTCMinutes() / 60;
+    // ===== Trading hours =====
     if (contract.tradingHours) {
+      const nowUTC = new Date();
+      const hoursUTC = nowUTC.getUTCHours() + nowUTC.getUTCMinutes() / 60;
       const { start, end } = contract.tradingHours;
-      if (hoursUTC < start || hoursUTC > end)
+      if (hoursUTC < start || hoursUTC >= end) {
         return res.status(400).json({ error: "MARKET_CLOSED" });
+      }
     }
 
-    // ===== Lot size check =====
+    // ===== Lot size =====
     if (quantity < contract.minQty || quantity % contract.qtyStep !== 0)
       return res.status(400).json({ error: "INVALID_LOT_SIZE" });
 
-    // ===== Risk engine pre-trade check =====
+    // ===== Risk engine =====
     const riskCheck = await preTradeRiskCheck(account_id, normSymbol, quantity);
     if (!riskCheck.ok)
       return res.status(400).json({ error: riskCheck.error });
@@ -87,30 +89,24 @@ router.post("/place-order", async (req, res) => {
     // ===== Idempotency check =====
     if (idempotency_key) {
       const { data: existingOrder } = await supabase
-        .from("trades")
+        .from("orders")
         .select("id, created_at")
         .eq("idempotency_key", idempotency_key)
         .single();
       if (existingOrder) {
-        const createdTime = new Date(existingOrder.created_at).getTime();
-        if (Date.now() - createdTime < 5000) {
-          console.warn(`⚠ Duplicate order detected for idempotency_key ${idempotency_key}`);
-          return res.status(200).json({
-            status: "duplicate",
-            message: "Order already processed",
-            order_id: existingOrder.id
-          });
-        }
+        return res.status(200).json({
+          status: "duplicate",
+          message: "Order already processed",
+          order_id: existingOrder.id
+        });
       }
     }
 
-    // ===== Get latest price for market orders from Redis =====
+    // ===== Market orders: fetch latest price =====
     let entryPrice = null;
     if (order_type.toLowerCase() === "market") {
       const cached = await getPriceFromRedis(normSymbol);
-      if (!cached || !cached.price) {
-        return res.status(400).json({ error: "NO_LIVE_PRICE" });
-      }
+      if (!cached?.price) return res.status(400).json({ error: "NO_LIVE_PRICE" });
       entryPrice = cached.price;
     }
 
@@ -127,14 +123,17 @@ router.post("/place-order", async (req, res) => {
       take_profit: take_profit ? Number(take_profit) : null,
       limit_price: limit_price ? Number(limit_price) : null,
       entry_price: entryPrice,
+      status: "pending",
       created_at: new Date().toISOString(),
       idempotency_key: idempotency_key || null
     };
 
-    // ===== Pass to matchingEngine =====
+    // 🚀 Forward to MatchingEngine (handles persistence + execution)
     await placeOrder(order);
 
-    console.log(`✅ Order accepted: ${order.id} (${order.type.toUpperCase()} ${order.size} ${order.symbol})`);
+    console.log(
+      `✅ Order sent to matchingEngine: ${order.id} (${order.type.toUpperCase()} ${order.size} ${order.symbol})`
+    );
 
     return res.json({
       status: "success",
@@ -142,7 +141,7 @@ router.post("/place-order", async (req, res) => {
         order.type === "market"
           ? "Market order sent for execution"
           : `Limit order accepted at ${order.limit_price}`,
-      order
+      order_id: order.id
     });
 
   } catch (err) {

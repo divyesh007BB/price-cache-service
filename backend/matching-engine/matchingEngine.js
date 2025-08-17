@@ -1,17 +1,21 @@
-// matchingEngine.js — Real Prop Firm Execution Engine (KeyDB/Redis Ready)
+// matchingEngine.js — Real Prop Firm Execution Engine (Topstep/FTMO style)
 
 require("dotenv").config();
 const { v4: uuidv4 } = require("uuid");
 const fetch = require("node-fetch");
-const Redis = require("ioredis"); // ✅ TCP Redis client for self-hosted Redis/KeyDB
+const Redis = require("ioredis");
 
-// Connect to local/compose KeyDB or Redis
 const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
 
 const { normalizeSymbol, getContracts, loadContractsFromDB } = require("../shared/symbolMap");
 const { addTick } = require("../shared/state");
 const { markSymbolActive, markSymbolInactive } = require("./feedControl");
 const { supabaseClient: supabase } = require("../shared/supabaseClient");
+
+const {
+  evaluateOpenPositions,
+  preTradeRiskCheck,
+} = require("../price-server/riskEngine");
 
 // ---------- Local State ----------
 let wsBroadcast = () => {};
@@ -21,31 +25,28 @@ let openTrades = [];
 let sessionPnL = new Map();
 let recentOrders = new Set();
 let accountLocks = new Map();
-const latestPrices = {}; // ✅ live in-memory price cache
+const latestPrices = {};
 
 // ---------- Constants ----------
 const EXECUTION_LATENCY_MS = 150;
 const SLTP_GRACE_MS = 1000;
-const ENABLE_PARTIAL_FILLS = false;
+const ENABLE_PARTIAL_FILLS = true;
 const PARTIAL_FILL_RATIO = 0.5;
 const PRICE_STALE_MS = 3000;
 const DUPLICATE_ORDER_MS = 500;
 
 // ---------- Helpers ----------
+function todayStr() {
+  return new Date().toISOString().split("T")[0];
+}
 const safeParse = (raw) => {
   try {
-    if (raw == null) return null;
-    if (typeof raw === "string") return JSON.parse(raw);
-    if (typeof raw === "object") return raw;
-    return null;
+    if (!raw) return null;
+    return typeof raw === "string" ? JSON.parse(raw) : raw;
   } catch {
     return null;
   }
 };
-
-function todayStr() {
-  return new Date().toISOString().split("T")[0];
-}
 
 // ===================================
 // INIT
@@ -68,22 +69,14 @@ async function loadInitialData() {
   });
 
   // Load pending orders
-  const { data: poData, error: poErr } = await supabase
-    .from("orders")
-    .select("*")
-    .eq("status", "pending");
-  if (poErr) throw poErr;
+  const { data: poData } = await supabase.from("orders").select("*").eq("status", "pending");
   pendingOrders = poData || [];
 
   // Load open trades
-  const { data: otData, error: otErr } = await supabase
-    .from("trades")
-    .select("*")
-    .eq("is_open", true);
-  if (otErr) throw otErr;
+  const { data: otData } = await supabase.from("trades").select("*").eq("is_open", true);
   openTrades = otData || [];
 
-  // Load initial prices from Redis/KeyDB
+  // Load prices from Redis
   try {
     const all = await redis.hgetall("latest_prices");
     for (const [symbol, val] of Object.entries(all)) {
@@ -94,17 +87,15 @@ async function loadInitialData() {
     console.error("❌ Failed to load initial prices from Redis/KeyDB", err);
   }
 
-  // Subscribe to price updates
   subscribePriceFeed();
-
   console.log(
     `✅ Loaded ${accounts.size} accounts, ${pendingOrders.length} pending orders, ${openTrades.length} open trades`
   );
   broadcastSnapshot();
 }
 
-function setBroadcaster(broadcastFn) {
-  wsBroadcast = broadcastFn;
+function setBroadcaster(fn) {
+  wsBroadcast = fn;
 }
 
 function broadcastSnapshot() {
@@ -122,50 +113,39 @@ function broadcastSnapshot() {
 async function subscribePriceFeed() {
   const sub = redis.duplicate();
   await sub.subscribe("prices");
-  sub.on("message", (channel, message) => {
-    if (channel === "prices") {
-      const { symbol, price, ts } = JSON.parse(message);
+  sub.on("message", (ch, msg) => {
+    if (ch === "prices") {
+      const { symbol, price, ts } = JSON.parse(msg);
       latestPrices[symbol] = { price, ts };
     }
   });
-  console.log("📡 Subscribed to Redis/KeyDB 'prices' channel");
+  console.log("📡 Subscribed to Redis/KeyDB 'prices'");
 }
 
 // ===================================
-// FETCH PRICE NOW (fallback only)
+// PRICE FETCH (fallback)
 // ===================================
 async function fetchPriceNow(symbol) {
-  const contracts = getContracts();
-  const meta = contracts[symbol];
+  const meta = getContracts()[symbol];
   if (!meta) return null;
-
   let price = null;
   try {
     const vendorSymbol = meta.priceKey || symbol;
-
-    if (vendorSymbol.startsWith("NSE:")) {
-      const yahooMap = { "NSE:NIFTY": "^NSEI" };
-      const yahooSymbol = yahooMap[vendorSymbol];
-      if (!yahooSymbol) return null;
-      const res = await fetch(
-        `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?interval=1m`
+    if (vendorSymbol.startsWith("BINANCE:")) {
+      const pair = vendorSymbol.replace("BINANCE:", "").toUpperCase();
+      const r = await fetch(
+        `https://api.binance.com/api/v3/ticker/price?symbol=${pair}`
       );
-      const data = await res.json();
-      price = data?.chart?.result?.[0]?.meta?.regularMarketPrice ?? null;
-    } else if (vendorSymbol.startsWith("BINANCE:")) {
-      const binancePair = vendorSymbol.replace("BINANCE:", "").toUpperCase();
-      const res = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${binancePair}`);
-      const data = await res.json();
-      if (data?.price) price = parseFloat(data.price);
+      const d = await r.json();
+      if (d?.price) price = parseFloat(d.price);
     }
-
     if (price && price > 0) {
       latestPrices[symbol] = { price, ts: Date.now() };
       addTick(symbol, price, Date.now());
       return price;
     }
   } catch (err) {
-    console.error(`❌ fetchPriceNow fail ${symbol}:`, err.message);
+    console.error(`❌ fetchPriceNow ${symbol}:`, err.message);
   }
   return null;
 }
@@ -174,76 +154,55 @@ async function fetchPriceNow(symbol) {
 // PROCESS TICK
 // ===================================
 async function processTick(symbol, price) {
-  const normSymbol = normalizeSymbol(symbol);
-  latestPrices[normSymbol] = { price, ts: Date.now() };
-  addTick(normSymbol, price, Date.now());
-  wsBroadcast({ type: "price", symbol: normSymbol, price, ts: Date.now() });
+  const norm = normalizeSymbol(symbol);
+  const prev = latestPrices[norm]?.price ?? price;
+  latestPrices[norm] = { price, ts: Date.now() };
+  addTick(norm, price, Date.now());
+  wsBroadcast({ type: "price", symbol: norm, price, ts: Date.now() });
 
   // Update uPnL
-  openTrades
-    .filter((t) => t.symbol === normSymbol)
-    .forEach((t) => {
-      const tickValue = getContracts()[t.symbol]?.tickValue ?? 1;
-      const upnl =
-        t.side === "buy"
-          ? (price - t.entry_price) * t.quantity * tickValue
-          : (t.entry_price - price) * t.quantity * tickValue;
-      wsBroadcast({ type: "trade_upnl", trade_id: t.id, upnl });
-    });
+  openTrades.filter((t) => t.symbol === norm).forEach((t) => {
+    const tickVal = getContracts()[t.symbol]?.tickValue ?? 1;
+    const upnl =
+      t.side === "buy"
+        ? (price - t.entry_price) * t.quantity * tickVal
+        : (t.entry_price - price) * t.quantity * tickVal;
+    wsBroadcast({ type: "trade_upnl", trade_id: t.id, upnl });
+
+    const acc = accounts.get(t.account_id);
+    if (acc) {
+      acc.upnl = (acc.upnl || 0) + upnl;
+      wsBroadcast({ type: "account_upnl", account_id: acc.id, upnl: acc.upnl });
+    }
+  });
 
   // Fill limit orders
   const toFill = pendingOrders.filter(
     (o) =>
-      o.symbol === normSymbol &&
+      o.symbol === norm &&
       ((o.side === "buy" && price <= o.limit_price) ||
         (o.side === "sell" && price >= o.limit_price))
   );
-  for (const order of toFill) await fillOrder(order, price);
+  for (const order of toFill) await fillOrder(order, price, prev);
 
-  // Auto-close SL/TP
+  // SL/TP auto-close
   const toClose = openTrades.filter((t) => {
-    if (t.symbol !== normSymbol) return false;
-    if (Date.now() - new Date(t.time_opened).getTime() < SLTP_GRACE_MS) return false;
-    if (t.side === "buy") {
+    if (t.symbol !== norm) return false;
+    if (Date.now() - new Date(t.time_opened).getTime() < SLTP_GRACE_MS)
+      return false;
+    if (t.side === "buy")
       return (
         (t.stop_loss != null && price <= t.stop_loss) ||
         (t.take_profit != null && price >= t.take_profit)
       );
-    } else {
-      return (
-        (t.stop_loss != null && price >= t.stop_loss) ||
-        (t.take_profit != null && price <= t.take_profit)
-      );
-    }
+    return (
+      (t.stop_loss != null && price >= t.stop_loss) ||
+      (t.take_profit != null && price <= t.take_profit)
+    );
   });
-  for (const trade of toClose) await closeTrade(trade, price);
-}
+  for (const t of toClose) await closeTrade(t, price);
 
-// ===================================
-// RISK (pre-trade)
-// ===================================
-async function preTradeRiskCheck(order, account) {
-  if (!account) return { ok: false, reason: "ACCOUNT_NOT_FOUND" };
-  if (account.status === "blown" || account.status === "paused")
-    return { ok: false, reason: "ACCOUNT_INACTIVE" };
-
-  const contract = getContracts()[order.symbol];
-  if (!contract) return { ok: false, reason: "UNSUPPORTED_SYMBOL" };
-
-  if (order.size < contract.minQty || order.size % contract.qtyStep !== 0)
-    return { ok: false, reason: "INVALID_QTY" };
-
-  if (
-    contract.maxLots?.[account.account_type] &&
-    order.size > contract.maxLots[account.account_type]
-  )
-    return { ok: false, reason: "MAX_LOT_SIZE" };
-
-  if (await breachesLossLimits(account)) return { ok: false, reason: "DAILY_LOSS_LIMIT" };
-
-  if (!withinTradingHours(order.symbol)) return { ok: false, reason: "MARKET_CLOSED" };
-
-  return { ok: true };
+  await evaluateOpenPositions(norm, price);
 }
 
 // ===================================
@@ -252,14 +211,18 @@ async function preTradeRiskCheck(order, account) {
 async function placeOrder(order) {
   order.symbol = normalizeSymbol(order.symbol);
 
-  const hash = `${order.account_id}-${order.symbol}-${order.side}-${order.size}-${order.type}`;
+  const hash = `${order.account_id}-${order.symbol}-${order.side}-${order.quantity}-${order.type}`;
   if (recentOrders.has(hash)) return rejectOrder(order, "DUPLICATE_ORDER");
   recentOrders.add(hash);
   setTimeout(() => recentOrders.delete(hash), DUPLICATE_ORDER_MS);
 
-  const account = accounts.get(order.account_id);
-  const riskCheck = await preTradeRiskCheck(order, account);
-  if (!riskCheck.ok) return rejectOrder(order, riskCheck.reason);
+  // Pre-trade risk check
+  const riskCheck = await preTradeRiskCheck(
+    order.account_id,
+    order.symbol,
+    order.quantity
+  );
+  if (!riskCheck.ok) return rejectOrder(order, riskCheck.error);
 
   markSymbolActive(order.symbol);
 
@@ -273,75 +236,128 @@ async function placeOrder(order) {
 
     const execPrice = await convertPrice(order.symbol, cached.price);
     const orderId = uuidv4();
-    await insertOrder(orderId, order, "market");
-    await fillOrder({ ...order, id: orderId }, execPrice);
+
+    await supabase.from("orders").insert({
+      id: orderId,
+      account_id: order.account_id,
+      user_id: order.user_id,
+      symbol: order.symbol,
+      side: order.side,
+      quantity: order.quantity,
+      order_type: "market",
+      entry_price: execPrice,
+      status: "filled",
+      created_at: new Date().toISOString(),
+      filled_at: new Date().toISOString(),
+    });
+
+    const postRisk = await evaluateImmediateRisk(
+      order.account_id,
+      order.symbol,
+      order.quantity,
+      execPrice
+    );
+    if (!postRisk.ok) return rejectOrder(order, postRisk.error);
+
+    await fillOrder({ ...order, id: orderId }, execPrice, cached.price);
   } else {
     const orderId = uuidv4();
     pendingOrders.push({ ...order, id: orderId });
     wsBroadcast({ type: "order_pending", order: { ...order, id: orderId } });
     broadcastSnapshot();
-    await insertOrder(orderId, order, "limit");
+    await supabase.from("orders").insert({
+      id: orderId,
+      account_id: order.account_id,
+      user_id: order.user_id,
+      symbol: order.symbol,
+      side: order.side,
+      quantity: order.quantity,
+      order_type: "limit",
+      limit_price: order.limit_price,
+      status: "pending",
+      created_at: new Date().toISOString(),
+    });
   }
 }
 
 // ===================================
 // FILL ORDER
 // ===================================
-async function fillOrder(order, basePrice) {
+async function fillOrder(order, basePrice, prevPrice) {
   const lock = accountLocks.get(order.account_id) || Promise.resolve();
   accountLocks.set(
     order.account_id,
     lock.then(async () => {
-      setTimeout(async () => {
-        const contract = getContracts()[order.symbol];
-        const spread = contract?.spread || 0;
-        const commission = contract?.commission || 0;
-        const slippage = contract?.slippage || 0;
+      await new Promise((resolve) =>
+        setTimeout(resolve, EXECUTION_LATENCY_MS)
+      );
 
-        const execPrice =
-          order.side === "buy"
-            ? basePrice + spread + slippage
-            : basePrice - spread - slippage;
+      const c = getContracts()[order.symbol];
+      const spread = c?.spread || 0;
+      const commission = c?.commission || 0;
 
-        const sizeToFill = ENABLE_PARTIAL_FILLS
-          ? Math.ceil(order.size * PARTIAL_FILL_RATIO)
-          : order.size;
+      const gap = Math.abs(basePrice - (prevPrice || basePrice));
+      const slippage =
+        gap > 0 ? Math.min(gap * 0.2, c?.maxSlippage || 5) : 0;
 
-        const trade = {
-          id: uuidv4(),
-          account_id: order.account_id,
-          user_id: order.user_id,
-          symbol: order.symbol,
-          side: order.side,
-          quantity: sizeToFill,
+      const execPrice =
+        order.side === "buy"
+          ? basePrice + spread + slippage
+          : basePrice - spread - slippage;
+
+      const risk = await evaluateImmediateRisk(
+        order.account_id,
+        order.symbol,
+        order.quantity,
+        execPrice
+      );
+      if (!risk.ok) return rejectOrder(order, risk.error);
+
+      const fillQty = ENABLE_PARTIAL_FILLS
+        ? Math.ceil(order.quantity * PARTIAL_FILL_RATIO)
+        : order.quantity;
+
+      const remainingQty = order.quantity - fillQty;
+
+      const trade = {
+        id: uuidv4(),
+        account_id: order.account_id,
+        user_id: order.user_id,
+        symbol: order.symbol,
+        side: order.side,
+        quantity: fillQty,
+        entry_price: execPrice,
+        stop_loss: order.stop_loss ?? null,
+        take_profit: order.take_profit ?? null,
+        is_open: true,
+        status: "open",
+        time_opened: new Date().toISOString(),
+        pnl: -commission * fillQty,
+        order_id: order.id,
+      };
+
+      pendingOrders = pendingOrders.filter((o) => o.id !== order.id);
+      openTrades.push(trade);
+      wsBroadcast({ type: "trade_fill", trade });
+      broadcastSnapshot();
+
+      await supabase
+        .from("orders")
+        .update({
+          status: remainingQty > 0 ? "partially_filled" : "filled",
           entry_price: execPrice,
-          stop_loss: order.stop_loss ?? null,
-          take_profit: order.take_profit ?? null,
-          is_open: true,
-          status: "open",
-          time_opened: new Date().toISOString(),
-          pnl: -commission * sizeToFill,
-        };
+          filled_at: new Date().toISOString(),
+        })
+        .eq("id", order.id);
 
-        pendingOrders = pendingOrders.filter((o) => o.id !== order.id);
-        openTrades.push(trade);
-        markSymbolActive(order.symbol);
-        wsBroadcast({ type: "trade_fill", trade });
-        broadcastSnapshot();
+      await supabase.from("trades").insert(trade);
+      await auditLog("ORDER_FILLED", { order, trade });
 
-        if (order.id) {
-          await supabase
-            .from("orders")
-            .update({
-              status: "filled",
-              entry_price: execPrice,
-              filled_at: new Date().toISOString(),
-            })
-            .eq("id", order.id);
-        }
-        await supabase.from("trades").insert(trade);
-        await auditLog("ORDER_FILLED", { order, trade });
-      }, EXECUTION_LATENCY_MS);
+      if (remainingQty > 0) {
+        const restOrder = { ...order, quantity: remainingQty };
+        pendingOrders.push(restOrder);
+        wsBroadcast({ type: "order_pending", order: restOrder });
+      }
     })
   );
 }
@@ -357,36 +373,42 @@ async function closeTrade(trade, closePrice) {
       : (trade.entry_price - closePrice) * trade.quantity * tickValue;
   const netPnL = pnl + (trade.pnl || 0);
 
-  const closedTrade = {
+  const closed = {
     ...trade,
     is_open: false,
     status: "closed",
-    time_closed: new Date().toISOString(),
     exit_price: closePrice,
     pnl: netPnL,
+    time_closed: new Date().toISOString(),
   };
 
   openTrades = openTrades.filter((t) => t.id !== trade.id);
-  wsBroadcast({ type: "trade_close", trade: closedTrade });
+  wsBroadcast({ type: "trade_close", trade: closed });
   broadcastSnapshot();
-  await supabase.from("trades").update(closedTrade).eq("id", trade.id);
+
+  await supabase.from("trades").update(closed).eq("id", trade.id);
+
+  if (trade.order_id) {
+    await supabase
+      .from("orders")
+      .update({
+        status: "closed",
+        exit_price: closePrice,
+        closed_at: new Date().toISOString(),
+      })
+      .eq("id", trade.order_id);
+  }
 
   const acc = accounts.get(trade.account_id);
   if (acc) {
     acc.current_balance += netPnL;
-
     let sess = sessionPnL.get(acc.id);
-    if (!sess || sess.day !== todayStr()) {
+    if (!sess || sess.day !== todayStr())
       sess = { day: todayStr(), realized: 0, bestDay: 0, total: 0 };
-    }
     sess.realized += netPnL;
     sess.total += netPnL;
     if (sess.realized > sess.bestDay) sess.bestDay = sess.realized;
     sessionPnL.set(acc.id, sess);
-
-    if (acc.profit_target && sess.bestDay > acc.profit_target * 0.5) {
-      acc.consistency_required = true;
-    }
 
     accounts.set(acc.id, acc);
     wsBroadcast({ type: "account_update", account: acc });
@@ -397,11 +419,8 @@ async function closeTrade(trade, closePrice) {
         current_balance: acc.current_balance,
         best_day_profit: sess.bestDay,
         total_profit: sess.total,
-        consistency_required: acc.consistency_required ?? false,
       })
       .eq("id", acc.id);
-
-    await checkMIL(acc, closePrice);
   }
 
   const stillActive =
@@ -409,54 +428,37 @@ async function closeTrade(trade, closePrice) {
     openTrades.some((t) => t.symbol === trade.symbol);
   if (!stillActive) markSymbolInactive(trade.symbol);
 
-  await auditLog("TRADE_CLOSED", { trade: closedTrade });
+  await auditLog("TRADE_CLOSED", { trade: closed });
 }
 
 // ===================================
-// OTHER HELPERS
+// RISK CHECK (inline immediate)
 // ===================================
-async function breachesLossLimits(account) {
-  const sess = sessionPnL.get(account.id);
-  if (!sess) return false;
-  if (account.max_intraday_loss && Math.abs(sess.realized) >= account.max_intraday_loss) {
-    return true;
+async function evaluateImmediateRisk(account_id, symbol, qty, execPrice) {
+  const acc = accounts.get(account_id);
+  if (!acc) return { ok: false, error: "ACCOUNT_NOT_FOUND" };
+
+  // Static max loss check
+  if (acc.current_balance <= (acc.initial_balance - acc.max_loss)) {
+    return { ok: false, error: "MAX_LOSS_REACHED" };
   }
-  return false;
-}
 
-async function checkMIL(acc, price) {
-  if (await breachesLossLimits(acc)) {
-    console.log(`💀 MIL breached for account ${acc.id} — marking blown`);
-    await supabase
-      .from("accounts")
-      .update({ status: "blown", breach_reason: "MAX_INTRADAY_LOSS" })
-      .eq("id", acc.id);
-    for (const pos of openTrades.filter((p) => p.account_id === acc.id)) {
-      await closeTrade(pos, price);
-    }
+  // Daily loss limit (simplified)
+  const sess = sessionPnL.get(account_id);
+  if (sess && sess.realized < -acc.daily_loss_limit) {
+    return { ok: false, error: "DAILY_LOSS_LIMIT" };
   }
+
+  return { ok: true };
 }
 
-function rejectOrder(order, code) {
-  wsBroadcast({ type: "order_reject", order, reason: code });
-  auditLog("ORDER_REJECTED", { order, reason: code });
-}
-
-async function insertOrder(id, order, type) {
-  await supabase.from("orders").insert({
-    id,
-    account_id: order.account_id,
-    user_id: order.user_id,
-    symbol: order.symbol,
-    side: order.side,
-    quantity: order.size,
-    order_type: type,
-    limit_price: order.limit_price ?? null,
-    stop_loss: order.stop_loss ?? null,
-    take_profit: order.take_profit ?? null,
-    status: type === "market" ? "new" : "pending",
-    created_at: new Date().toISOString(),
-  });
+// ===================================
+// UTILS
+// ===================================
+function rejectOrder(order, reason) {
+  wsBroadcast({ type: "order_reject", order, reason });
+  auditLog("ORDER_REJECTED", { order, reason });
+  return { ok: false, reason };
 }
 
 async function auditLog(event, payload) {
@@ -471,33 +473,12 @@ async function auditLog(event, payload) {
 async function convertPrice(symbol, price) {
   const meta = getContracts()[symbol];
   if (meta?.convertToINR) {
-    const usdInrRaw = latestPrices["USDINR"] || safeParse(await redis.get("price:USDINR"));
+    const usdInrRaw =
+      latestPrices["USDINR"] || safeParse(await redis.get("price:USDINR"));
     const usdInr = usdInrRaw?.price ?? 83;
     return price * usdInr;
   }
   return price;
-}
-
-function withinTradingHours(symbol) {
-  const now = new Date();
-  const nowIST = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
-  const hours = nowIST.getHours() + nowIST.getMinutes() / 60;
-  const contract = getContracts()[symbol];
-  if (!contract?.tradingHours) return true;
-  return hours >= contract.tradingHours.start && hours <= contract.tradingHours.end;
-}
-
-// ===================================
-// GETTERS
-// ===================================
-function getOpenTrades() {
-  return openTrades;
-}
-function getAccounts() {
-  return Array.from(accounts.values());
-}
-function getPendingOrders() {
-  return pendingOrders;
 }
 
 // ===================================
@@ -510,7 +491,4 @@ module.exports = {
   placeOrder,
   fillOrder,
   closeTrade,
-  getOpenTrades,
-  getAccounts,
-  getPendingOrders,
 };
