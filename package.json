@@ -16,6 +16,7 @@
     "dayjs": "^1.11.10",
     "dotenv": "^16.6.1",
     "express": "^4.19.2",
+    "express-rate-limit": "^8.0.1",
     "ioredis": "^5.4.1",
     "node-fetch": "^3.3.2",
     "uuid": "^11.1.0",
