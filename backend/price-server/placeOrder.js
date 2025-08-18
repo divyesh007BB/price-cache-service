@@ -1,4 +1,4 @@
-// placeOrder.js — Gateway API for order validation + persistence (prop firm style)
+// placeOrder.js — Gateway API for order validation + forwarding (prop firm style)
 
 const express = require("express");
 const router = express.Router();
@@ -131,34 +131,26 @@ router.post("/", async (req, res) => {
       symbol: normSymbol,
       side: side.toLowerCase(),
       quantity: Number(quantity),
-      order_type: order_type.toLowerCase(),
+      type: order_type.toLowerCase(), // match matchingEngine field
       stop_loss: stop_loss ? Number(stop_loss) : null,
       take_profit: take_profit ? Number(take_profit) : null,
       limit_price: limit_price ? Number(limit_price) : null,
       entry_price: entryPrice,
-      status: "pending",
-      created_at: new Date().toISOString(),
       idempotency_key: idempotency_key || null,
+      created_at: new Date().toISOString(),
     };
 
-    // --- Persist order (pending) ---
-    const { error: insertErr } = await supabase.from("orders").insert([order]);
-    if (insertErr) {
-      console.error("❌ Supabase insert error:", insertErr.message);
-      return res.status(500).json({ error: "DB_INSERT_FAILED" });
-    }
-
-    // 🚀 Forward to MatchingEngine
+    // 🚀 Forward to MatchingEngine (this will handle persistence + execution)
     await placeOrder(order);
 
     console.log(
-      `✅ Order sent to matchingEngine: ${order.id} (${order.order_type.toUpperCase()} ${order.quantity} ${order.symbol})`
+      `✅ Order forwarded to matchingEngine: ${order.id} (${order.type.toUpperCase()} ${order.quantity} ${order.symbol})`
     );
 
     return res.json({
       status: "success",
       message:
-        order.order_type === "market"
+        order.type === "market"
           ? "Market order sent for execution"
           : `Limit order accepted at ${order.limit_price}`,
       order_id: order.id,

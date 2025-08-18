@@ -16,7 +16,11 @@ dayjs.extend(timezone);
 // ===== Shared Imports =====
 const { normalizeSymbol } = require("../shared/symbolMap");
 const { WHITELIST, addTick, getTicks } = require("../shared/state");
-const { processTick } = require("../matching-engine/matchingEngine");
+const {
+  processTick,
+  setBroadcaster,
+  loadInitialData,
+} = require("../matching-engine/matchingEngine");
 const placeOrderRoute = require("./placeOrder");
 
 // ===== CONFIG =====
@@ -51,6 +55,7 @@ const HISTORY_INTERVAL_MS = 1000;
 function bufferPrice(symbol, price, ts) {
   priceBuffer[symbol] = JSON.stringify({ price, ts });
 }
+
 async function flushPrices() {
   if (Object.keys(priceBuffer).length > 0) {
     try {
@@ -75,6 +80,7 @@ async function saveTickHistoryThrottled(symbol, price, ts) {
     }
   }
 }
+
 async function getPrice(symbol) {
   try {
     const raw = await redis.hget("latest_prices", symbol);
@@ -84,7 +90,8 @@ async function getPrice(symbol) {
     return null;
   }
 }
-async function getRecentTicks(symbol, limit = 50) {
+
+async function getRecentTicks(symbol, limit = 20) { // reduced for perf
   const buf = getTicks(symbol);
   if (buf.length > 0) return buf.slice(-limit);
   try {
@@ -101,6 +108,7 @@ redisSub.subscribe("price_ticks", (err) => {
   if (err) console.error("❌ Failed to subscribe:", err);
   else logEvent("START", "Subscribed to Redis channel: price_ticks");
 });
+
 redisSub.on("message", (channel, message) => {
   try {
     const tick = JSON.parse(message);
@@ -108,7 +116,7 @@ redisSub.on("message", (channel, message) => {
     addTick(tick.symbol, tick.price, tick.ts);
     saveTickHistoryThrottled(tick.symbol, tick.price, tick.ts);
     throttledBroadcast({ type: "price", ...tick });
-    processTick(tick.symbol, tick.price, tick.ts);
+    processTick(tick.symbol, tick.price); // ✅ risk engine + fills
   } catch (err) {
     logEvent("ERR", "Redis tick parse failed", err.message);
   }
@@ -125,6 +133,7 @@ function throttledBroadcast(msg) {
   TPS_BUCKET.count++;
   broadcast(msg);
 }
+
 function broadcast(msg) {
   const data = JSON.stringify(msg);
   for (const client of wss.clients) {
@@ -187,8 +196,19 @@ const wss = new WebSocket.Server({ noServer: true });
 function heartbeat() { this.isAlive = true; }
 
 // ===== Startup =====
-const server = app.listen(PORT, "0.0.0.0", () => {
+const server = app.listen(PORT, "0.0.0.0", async () => {
   logEvent("START", `Price Server running on port ${PORT} (subscriber mode)`);
+
+  // ✅ Hook broadcaster into matching engine
+  setBroadcaster((msg) => throttledBroadcast(msg));
+
+  // ✅ Load initial DB/Redis state
+  try {
+    await loadInitialData();
+    logEvent("INIT", "Loaded initial data from Supabase + Redis");
+  } catch (err) {
+    logEvent("ERR", "Initial data load failed", err.message);
+  }
 });
 
 // ===== WS Auth + Upgrade =====
@@ -247,7 +267,7 @@ wss.on("connection", async (ws, req) => {
   for (const sym of WHITELIST) {
     const cached = await getPrice(sym);
     if (cached) ws.send(JSON.stringify({ type: "price", symbol: sym, ...cached }));
-    const history = await getRecentTicks(sym, 50);
+    const history = await getRecentTicks(sym, 20); // reduced snapshot
     if (history.length)
       ws.send(JSON.stringify({ type: "history", symbol: sym, ticks: history }));
   }
@@ -269,6 +289,7 @@ process.on("SIGINT", async () => {
   await redisSub.quit();
   server.close(() => process.exit(0));
 });
+
 process.on("unhandledRejection", (err) =>
   logEvent("FATAL", "UnhandledRejection", err)
 );
