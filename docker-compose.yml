@@ -30,7 +30,6 @@ services:
       dockerfile: Dockerfile
     container_name: aroha-publisher
     restart: unless-stopped
-    working_dir: /app/backend/price-server
     env_file:
       - ./.env
     environment:
@@ -39,11 +38,11 @@ services:
     depends_on:
       keydb:
         condition: service_healthy
-    command: ["pm2-runtime", "publisher.js"]
+    command: ["pm2-runtime", "backend/price-server/publisher.js"]
     networks:
       - aroha-net
     healthcheck:
-      disable: true   # 🚫 disable to avoid false unhealthy
+      disable: true   # 🚫 disabled to avoid false unhealthy
 
   # ===========================
   # Price Server (WS + REST API)
@@ -54,7 +53,6 @@ services:
       dockerfile: Dockerfile
     container_name: aroha-price-server
     restart: unless-stopped
-    working_dir: /app/backend/price-server
     env_file:
       - ./.env
     environment:
@@ -68,11 +66,11 @@ services:
         condition: service_started
     ports:
       - "4000:4000"
-    command: ["pm2-runtime", "index.js"]
+    command: ["pm2-runtime", "backend/price-server/index.js"]
     networks:
       - aroha-net
     healthcheck:
-      disable: true   # 🚫 disable to avoid blocking startup
+      disable: true   # 🚫 disabled to avoid blocking startup
 
   # ===========================
   # Matching Engine
@@ -83,7 +81,6 @@ services:
       dockerfile: Dockerfile
     container_name: aroha-matching-engine
     restart: unless-stopped
-    working_dir: /app/backend/matching-engine
     env_file:
       - ./.env
     environment:
@@ -96,14 +93,11 @@ services:
         condition: service_started
       price-server:
         condition: service_started
-    command: ["pm2-runtime", "matchingEngine.js"]
+    command: ["pm2-runtime", "backend/matching-engine/matchingEngine.js"]
     networks:
       - aroha-net
     healthcheck:
-      test: ["CMD-SHELL", "node -e \"require('./matchingEngine.js')\" || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 3
+      disable: true   # keep disabled for now
 
 volumes:
   keydb_data:

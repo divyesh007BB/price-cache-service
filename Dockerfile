@@ -1,6 +1,6 @@
 FROM node:20-alpine
 
-# Set working dir
+# Set working dir at project root
 WORKDIR /app
 
 # Copy root package.json and package-lock.json
@@ -12,8 +12,11 @@ RUN npm install --only=production && npm install -g pm2
 # Copy backend code
 COPY backend /app/backend
 
+# Environment
 ENV NODE_ENV=production
 
-# Default CMD (overridden by docker-compose for each service)
-WORKDIR /app/backend
-CMD ["pm2-runtime", "price-server/index.js"]
+# Always run commands from /app (so node_modules resolve correctly)
+WORKDIR /app
+
+# Default CMD (can be overridden in docker-compose for each service)
+CMD ["pm2-runtime", "backend/price-server/index.js"]
