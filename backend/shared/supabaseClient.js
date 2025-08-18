@@ -16,7 +16,6 @@ function requireEnv(varName) {
 }
 
 const SUPABASE_URL = requireEnv("SUPABASE_URL");
-// ✅ Use SERVICE_ROLE_KEY from .env
 const SUPABASE_SERVICE_KEY = requireEnv("SUPABASE_SERVICE_ROLE_KEY");
 
 // ===== Masked logging (optional) =====
@@ -36,7 +35,7 @@ async function safeFetch(...args) {
       return await fetch(...args);
     } catch (err) {
       attempts++;
-      if (attempts >= 3) throw err;
+      if (attempts >= 5) throw err; // allow up to 5 retries
       console.warn(`⚠ Supabase fetch retry ${attempts}:`, err.message);
       await new Promise((res) => setTimeout(res, 500 * attempts));
     }

@@ -1,21 +1,22 @@
-// matchingEngine.js — Real Prop Firm Execution Engine (Topstep/FTMO style)
+// backend/matching-engine/matchingEngine.js — Real Prop Firm Execution Engine (Topstep/FTMO style)
 
 require("dotenv").config();
 const { v4: uuidv4 } = require("uuid");
 const fetch = require("node-fetch");
 const Redis = require("ioredis");
 
-const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379");
+const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379", {
+  maxRetriesPerRequest: null,
+  enableReadyCheck: true,
+  retryStrategy: (times) => Math.min(times * 200, 2000),
+});
 
 const { normalizeSymbol, getContracts, loadContractsFromDB } = require("../shared/symbolMap");
 const { addTick } = require("../shared/state");
 const { markSymbolActive, markSymbolInactive } = require("./feedControl");
 const { supabaseClient: supabase } = require("../shared/supabaseClient");
 
-const {
-  evaluateOpenPositions,
-  preTradeRiskCheck,
-} = require("../price-server/riskEngine");
+const { evaluateOpenPositions, preTradeRiskCheck } = require("../price-server/riskEngine");
 
 // ---------- Local State ----------
 let wsBroadcast = () => {};
@@ -31,8 +32,7 @@ const latestPrices = {};
 const EXECUTION_LATENCY_MS = 150;
 const SLTP_GRACE_MS = 1000;
 const ENABLE_PARTIAL_FILLS = true;
-const PARTIAL_FILL_RATIO = 0.5;
-const PRICE_STALE_MS = 3000;
+const PRICE_STALE_MS = 5000;
 const DUPLICATE_ORDER_MS = 500;
 
 // ---------- Helpers ----------
@@ -55,7 +55,6 @@ async function loadInitialData() {
   console.log("📦 Loading initial data from Supabase...");
   await loadContractsFromDB();
 
-  // Load accounts
   const { data: accData, error: accErr } = await supabase.from("accounts").select("*");
   if (accErr) throw accErr;
   accData.forEach((acc) => {
@@ -68,15 +67,12 @@ async function loadInitialData() {
     });
   });
 
-  // Load pending orders
   const { data: poData } = await supabase.from("orders").select("*").eq("status", "pending");
   pendingOrders = poData || [];
 
-  // Load open trades
   const { data: otData } = await supabase.from("trades").select("*").eq("is_open", true);
   openTrades = otData || [];
 
-  // Load prices from Redis
   try {
     const all = await redis.hgetall("latest_prices");
     for (const [symbol, val] of Object.entries(all)) {
@@ -88,9 +84,7 @@ async function loadInitialData() {
   }
 
   subscribePriceFeed();
-  console.log(
-    `✅ Loaded ${accounts.size} accounts, ${pendingOrders.length} pending orders, ${openTrades.length} open trades`
-  );
+  console.log(`✅ Loaded ${accounts.size} accounts, ${pendingOrders.length} pending orders, ${openTrades.length} open trades`);
   broadcastSnapshot();
 }
 
@@ -99,12 +93,14 @@ function setBroadcaster(fn) {
 }
 
 function broadcastSnapshot() {
-  wsBroadcast({
-    type: "sync_state",
-    accounts: Array.from(accounts.values()),
-    pendingOrders,
-    openTrades,
-  });
+  try {
+    wsBroadcast({
+      type: "sync_state",
+      accounts: Array.from(accounts.values()),
+      pendingOrders,
+      openTrades,
+    });
+  } catch {}
 }
 
 // ===================================
@@ -112,14 +108,14 @@ function broadcastSnapshot() {
 // ===================================
 async function subscribePriceFeed() {
   const sub = redis.duplicate();
-  await sub.subscribe("prices");
+  await sub.subscribe("price_ticks"); // ✅ FIXED channel name
   sub.on("message", (ch, msg) => {
-    if (ch === "prices") {
+    if (ch === "price_ticks") {
       const { symbol, price, ts } = JSON.parse(msg);
       latestPrices[symbol] = { price, ts };
     }
   });
-  console.log("📡 Subscribed to Redis/KeyDB 'prices'");
+  console.log("📡 Subscribed to Redis/KeyDB 'price_ticks'");
 }
 
 // ===================================
@@ -133,9 +129,7 @@ async function fetchPriceNow(symbol) {
     const vendorSymbol = meta.priceKey || symbol;
     if (vendorSymbol.startsWith("BINANCE:")) {
       const pair = vendorSymbol.replace("BINANCE:", "").toUpperCase();
-      const r = await fetch(
-        `https://api.binance.com/api/v3/ticker/price?symbol=${pair}`
-      );
+      const r = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${pair}`);
       const d = await r.json();
       if (d?.price) price = parseFloat(d.price);
     }
@@ -158,22 +152,22 @@ async function processTick(symbol, price) {
   const prev = latestPrices[norm]?.price ?? price;
   latestPrices[norm] = { price, ts: Date.now() };
   addTick(norm, price, Date.now());
-  wsBroadcast({ type: "price", symbol: norm, price, ts: Date.now() });
+  try {
+    wsBroadcast({ type: "price", symbol: norm, price, ts: Date.now() });
+  } catch {}
 
-  // Update uPnL
-  openTrades.filter((t) => t.symbol === norm).forEach((t) => {
-    const tickVal = getContracts()[t.symbol]?.tickValue ?? 1;
-    const upnl =
-      t.side === "buy"
+  // Update unrealized PnL
+  accounts.forEach((acc) => {
+    const accTrades = openTrades.filter((t) => t.account_id === acc.id);
+    acc.upnl = accTrades.reduce((sum, t) => {
+      const tickVal = getContracts()[t.symbol]?.tickValue ?? 1;
+      return sum + (t.side === "buy"
         ? (price - t.entry_price) * t.quantity * tickVal
-        : (t.entry_price - price) * t.quantity * tickVal;
-    wsBroadcast({ type: "trade_upnl", trade_id: t.id, upnl });
-
-    const acc = accounts.get(t.account_id);
-    if (acc) {
-      acc.upnl = (acc.upnl || 0) + upnl;
+        : (t.entry_price - price) * t.quantity * tickVal);
+    }, 0);
+    try {
       wsBroadcast({ type: "account_upnl", account_id: acc.id, upnl: acc.upnl });
-    }
+    } catch {}
   });
 
   // Fill limit orders
@@ -188,17 +182,12 @@ async function processTick(symbol, price) {
   // SL/TP auto-close
   const toClose = openTrades.filter((t) => {
     if (t.symbol !== norm) return false;
-    if (Date.now() - new Date(t.time_opened).getTime() < SLTP_GRACE_MS)
-      return false;
+    if (Date.now() - new Date(t.time_opened).getTime() < SLTP_GRACE_MS) return false;
     if (t.side === "buy")
-      return (
-        (t.stop_loss != null && price <= t.stop_loss) ||
-        (t.take_profit != null && price >= t.take_profit)
-      );
-    return (
-      (t.stop_loss != null && price >= t.stop_loss) ||
-      (t.take_profit != null && price <= t.take_profit)
-    );
+      return (t.stop_loss != null && price <= t.stop_loss) ||
+             (t.take_profit != null && price >= t.take_profit);
+    return (t.stop_loss != null && price >= t.stop_loss) ||
+           (t.take_profit != null && price <= t.take_profit);
   });
   for (const t of toClose) await closeTrade(t, price);
 
@@ -216,12 +205,7 @@ async function placeOrder(order) {
   recentOrders.add(hash);
   setTimeout(() => recentOrders.delete(hash), DUPLICATE_ORDER_MS);
 
-  // Pre-trade risk check
-  const riskCheck = await preTradeRiskCheck(
-    order.account_id,
-    order.symbol,
-    order.quantity
-  );
+  const riskCheck = await preTradeRiskCheck(order.account_id, order.symbol, order.quantity);
   if (!riskCheck.ok) return rejectOrder(order, riskCheck.error);
 
   markSymbolActive(order.symbol);
@@ -237,46 +221,52 @@ async function placeOrder(order) {
     const execPrice = await convertPrice(order.symbol, cached.price);
     const orderId = uuidv4();
 
-    await supabase.from("orders").insert({
-      id: orderId,
-      account_id: order.account_id,
-      user_id: order.user_id,
-      symbol: order.symbol,
-      side: order.side,
-      quantity: order.quantity,
-      order_type: "market",
-      entry_price: execPrice,
-      status: "filled",
-      created_at: new Date().toISOString(),
-      filled_at: new Date().toISOString(),
-    });
+    try {
+      await supabase.from("orders").insert({
+        id: orderId,
+        account_id: order.account_id,
+        user_id: order.user_id,
+        symbol: order.symbol,
+        side: order.side,
+        quantity: order.quantity,
+        order_type: "market",
+        entry_price: execPrice,
+        status: "filled",
+        created_at: new Date().toISOString(),
+        filled_at: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error("❌ Supabase insert orders:", err.message);
+    }
 
-    const postRisk = await evaluateImmediateRisk(
-      order.account_id,
-      order.symbol,
-      order.quantity,
-      execPrice
-    );
+    const postRisk = await evaluateImmediateRisk(order.account_id, order.symbol, order.quantity, execPrice);
     if (!postRisk.ok) return rejectOrder(order, postRisk.error);
 
     await fillOrder({ ...order, id: orderId }, execPrice, cached.price);
   } else {
     const orderId = uuidv4();
-    pendingOrders.push({ ...order, id: orderId });
-    wsBroadcast({ type: "order_pending", order: { ...order, id: orderId } });
+    const newOrder = { ...order, id: orderId };
+    pendingOrders.push(newOrder);
+    try {
+      wsBroadcast({ type: "order_pending", order: newOrder });
+    } catch {}
     broadcastSnapshot();
-    await supabase.from("orders").insert({
-      id: orderId,
-      account_id: order.account_id,
-      user_id: order.user_id,
-      symbol: order.symbol,
-      side: order.side,
-      quantity: order.quantity,
-      order_type: "limit",
-      limit_price: order.limit_price,
-      status: "pending",
-      created_at: new Date().toISOString(),
-    });
+    try {
+      await supabase.from("orders").insert({
+        id: orderId,
+        account_id: order.account_id,
+        user_id: order.user_id,
+        symbol: order.symbol,
+        side: order.side,
+        quantity: order.quantity,
+        order_type: "limit",
+        limit_price: order.limit_price,
+        status: "pending",
+        created_at: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error("❌ Supabase insert limit order:", err.message);
+    }
   }
 }
 
@@ -288,33 +278,23 @@ async function fillOrder(order, basePrice, prevPrice) {
   accountLocks.set(
     order.account_id,
     lock.then(async () => {
-      await new Promise((resolve) =>
-        setTimeout(resolve, EXECUTION_LATENCY_MS)
-      );
+      await new Promise((r) => setTimeout(r, EXECUTION_LATENCY_MS));
 
       const c = getContracts()[order.symbol];
       const spread = c?.spread || 0;
       const commission = c?.commission || 0;
-
       const gap = Math.abs(basePrice - (prevPrice || basePrice));
-      const slippage =
-        gap > 0 ? Math.min(gap * 0.2, c?.maxSlippage || 5) : 0;
+      const slippage = gap > 0 ? Math.min(gap * 0.2, c?.maxSlippage || 5) : 0;
 
-      const execPrice =
-        order.side === "buy"
-          ? basePrice + spread + slippage
-          : basePrice - spread - slippage;
+      const execPrice = order.side === "buy"
+        ? basePrice + spread + slippage
+        : basePrice - spread - slippage;
 
-      const risk = await evaluateImmediateRisk(
-        order.account_id,
-        order.symbol,
-        order.quantity,
-        execPrice
-      );
+      const risk = await evaluateImmediateRisk(order.account_id, order.symbol, order.quantity, execPrice);
       if (!risk.ok) return rejectOrder(order, risk.error);
 
       const fillQty = ENABLE_PARTIAL_FILLS
-        ? Math.ceil(order.quantity * PARTIAL_FILL_RATIO)
+        ? Math.max(1, Math.floor(order.quantity * (Math.random() * 0.5 + 0.5)))
         : order.quantity;
 
       const remainingQty = order.quantity - fillQty;
@@ -338,25 +318,30 @@ async function fillOrder(order, basePrice, prevPrice) {
 
       pendingOrders = pendingOrders.filter((o) => o.id !== order.id);
       openTrades.push(trade);
-      wsBroadcast({ type: "trade_fill", trade });
+      try {
+        wsBroadcast({ type: "trade_fill", trade });
+      } catch {}
       broadcastSnapshot();
 
-      await supabase
-        .from("orders")
-        .update({
+      try {
+        await supabase.from("orders").update({
           status: remainingQty > 0 ? "partially_filled" : "filled",
           entry_price: execPrice,
           filled_at: new Date().toISOString(),
-        })
-        .eq("id", order.id);
+        }).eq("id", order.id);
+        await supabase.from("trades").insert(trade);
+      } catch (err) {
+        console.error("❌ Supabase trade insert:", err.message);
+      }
 
-      await supabase.from("trades").insert(trade);
       await auditLog("ORDER_FILLED", { order, trade });
 
       if (remainingQty > 0) {
-        const restOrder = { ...order, quantity: remainingQty };
+        const restOrder = { ...order, id: uuidv4(), quantity: remainingQty }; // ✅ new id
         pendingOrders.push(restOrder);
-        wsBroadcast({ type: "order_pending", order: restOrder });
+        try {
+          wsBroadcast({ type: "order_pending", order: restOrder });
+        } catch {}
       }
     })
   );
@@ -367,10 +352,9 @@ async function fillOrder(order, basePrice, prevPrice) {
 // ===================================
 async function closeTrade(trade, closePrice) {
   const tickValue = getContracts()[trade.symbol]?.tickValue ?? 1;
-  const pnl =
-    trade.side === "buy"
-      ? (closePrice - trade.entry_price) * trade.quantity * tickValue
-      : (trade.entry_price - closePrice) * trade.quantity * tickValue;
+  const pnl = trade.side === "buy"
+    ? (closePrice - trade.entry_price) * trade.quantity * tickValue
+    : (trade.entry_price - closePrice) * trade.quantity * tickValue;
   const netPnL = pnl + (trade.pnl || 0);
 
   const closed = {
@@ -383,44 +367,47 @@ async function closeTrade(trade, closePrice) {
   };
 
   openTrades = openTrades.filter((t) => t.id !== trade.id);
-  wsBroadcast({ type: "trade_close", trade: closed });
+  try {
+    wsBroadcast({ type: "trade_close", trade: closed });
+  } catch {}
   broadcastSnapshot();
 
-  await supabase.from("trades").update(closed).eq("id", trade.id);
-
-  if (trade.order_id) {
-    await supabase
-      .from("orders")
-      .update({
+  try {
+    await supabase.from("trades").update(closed).eq("id", trade.id);
+    if (trade.order_id) {
+      await supabase.from("orders").update({
         status: "closed",
         exit_price: closePrice,
         closed_at: new Date().toISOString(),
-      })
-      .eq("id", trade.order_id);
+      }).eq("id", trade.order_id);
+    }
+  } catch (err) {
+    console.error("❌ Supabase update trade/order:", err.message);
   }
 
   const acc = accounts.get(trade.account_id);
   if (acc) {
     acc.current_balance += netPnL;
     let sess = sessionPnL.get(acc.id);
-    if (!sess || sess.day !== todayStr())
-      sess = { day: todayStr(), realized: 0, bestDay: 0, total: 0 };
+    if (!sess || sess.day !== todayStr()) sess = { day: todayStr(), realized: 0, bestDay: 0, total: 0 };
     sess.realized += netPnL;
     sess.total += netPnL;
     if (sess.realized > sess.bestDay) sess.bestDay = sess.realized;
     sessionPnL.set(acc.id, sess);
 
-    accounts.set(acc.id, acc);
-    wsBroadcast({ type: "account_update", account: acc });
-
-    await supabase
-      .from("accounts")
-      .update({
+    accounts.set(acc.id, acc); // ✅ ensure saved
+    try {
+      wsBroadcast({ type: "account_update", account: acc });
+    } catch {}
+    try {
+      await supabase.from("accounts").update({
         current_balance: acc.current_balance,
         best_day_profit: sess.bestDay,
         total_profit: sess.total,
-      })
-      .eq("id", acc.id);
+      }).eq("id", acc.id);
+    } catch (err) {
+      console.error("❌ Supabase update account:", err.message);
+    }
   }
 
   const stillActive =
@@ -432,23 +419,19 @@ async function closeTrade(trade, closePrice) {
 }
 
 // ===================================
-// RISK CHECK (inline immediate)
+// RISK CHECK
 // ===================================
 async function evaluateImmediateRisk(account_id, symbol, qty, execPrice) {
   const acc = accounts.get(account_id);
   if (!acc) return { ok: false, error: "ACCOUNT_NOT_FOUND" };
 
-  // Static max loss check
   if (acc.current_balance <= (acc.initial_balance - acc.max_loss)) {
     return { ok: false, error: "MAX_LOSS_REACHED" };
   }
-
-  // Daily loss limit (simplified)
   const sess = sessionPnL.get(account_id);
-  if (sess && sess.realized < -acc.daily_loss_limit) {
+  if (sess && sess.realized <= -Math.abs(acc.daily_loss_limit)) {
     return { ok: false, error: "DAILY_LOSS_LIMIT" };
   }
-
   return { ok: true };
 }
 
@@ -456,25 +439,30 @@ async function evaluateImmediateRisk(account_id, symbol, qty, execPrice) {
 // UTILS
 // ===================================
 function rejectOrder(order, reason) {
-  wsBroadcast({ type: "order_reject", order, reason });
+  try {
+    wsBroadcast({ type: "order_reject", order, reason });
+  } catch {}
   auditLog("ORDER_REJECTED", { order, reason });
   return { ok: false, reason };
 }
 
 async function auditLog(event, payload) {
-  await supabase.from("trade_audit_logs").insert({
-    id: uuidv4(),
-    event,
-    payload,
-    created_at: new Date().toISOString(),
-  });
+  try {
+    await supabase.from("trade_audit_logs").insert({
+      id: uuidv4(),
+      event,
+      payload: JSON.stringify(payload),
+      created_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("❌ auditLog insert failed:", err.message);
+  }
 }
 
 async function convertPrice(symbol, price) {
   const meta = getContracts()[symbol];
   if (meta?.convertToINR) {
-    const usdInrRaw =
-      latestPrices["USDINR"] || safeParse(await redis.get("price:USDINR"));
+    const usdInrRaw = latestPrices["USDINR"] || safeParse(await redis.get("price:USDINR"));
     const usdInr = usdInrRaw?.price ?? 83;
     return price * usdInr;
   }

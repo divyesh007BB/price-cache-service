@@ -12,10 +12,14 @@ const Redis = require("ioredis");
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY // ✅ keep consistent with rest of backend
+  process.env.SUPABASE_SERVICE_KEY
 );
 
-const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379");
+const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379", {
+  maxRetriesPerRequest: null,
+  enableReadyCheck: true,
+  retryStrategy: (times) => Math.min(times * 200, 2000),
+});
 
 // ===== Helper =====
 function getWhitelist() {
@@ -25,8 +29,13 @@ function getWhitelist() {
 }
 
 async function getPriceFromRedis(symbol) {
-  const raw = await redis.hget("latest_prices", symbol);
-  return raw ? JSON.parse(raw) : null;
+  try {
+    const raw = await redis.hget("latest_prices", symbol);
+    return raw ? JSON.parse(raw) : null;
+  } catch (err) {
+    console.error("❌ Redis getPriceFromRedis error:", err);
+    return null;
+  }
 }
 
 // ===== Route =====
@@ -42,12 +51,14 @@ router.post("/", async (req, res) => {
       stop_loss,
       take_profit,
       limit_price,
-      idempotency_key
+      idempotency_key,
     } = req.body;
 
-    console.log(`📝 Incoming order: user=${user_id}, acc=${account_id}, sym=${symbol}, type=${order_type}, qty=${quantity}`);
+    console.log(
+      `📝 Incoming order: user=${user_id}, acc=${account_id}, sym=${symbol}, type=${order_type}, qty=${quantity}`
+    );
 
-    // ===== Validation =====
+    // --- Validation ---
     if (!user_id) return res.status(400).json({ error: "Missing user_id" });
     if (!account_id) return res.status(400).json({ error: "Missing account_id" });
     if (!symbol) return res.status(400).json({ error: "Missing symbol" });
@@ -58,8 +69,9 @@ router.post("/", async (req, res) => {
     if (order_type.toLowerCase() === "limit" && !limit_price)
       return res.status(400).json({ error: "Limit orders require limit_price" });
 
-    // ===== Whitelist =====
     const normSymbol = normalizeSymbol(symbol);
+
+    // --- Whitelist ---
     if (!getWhitelist().has(normSymbol))
       return res.status(400).json({ error: "SYMBOL_NOT_SUPPORTED" });
 
@@ -67,8 +79,8 @@ router.post("/", async (req, res) => {
     if (!contract)
       return res.status(400).json({ error: "CONTRACT_META_NOT_FOUND" });
 
-    // ===== Trading hours =====
-    if (contract.tradingHours) {
+    // --- Trading hours ---
+    if (contract?.tradingHours) {
       const nowUTC = new Date();
       const hoursUTC = nowUTC.getUTCHours() + nowUTC.getUTCMinutes() / 60;
       const { start, end } = contract.tradingHours;
@@ -77,75 +89,82 @@ router.post("/", async (req, res) => {
       }
     }
 
-    // ===== Lot size =====
+    // --- Lot size ---
     if (quantity < contract.minQty || quantity % contract.qtyStep !== 0)
       return res.status(400).json({ error: "INVALID_LOT_SIZE" });
 
-    // ===== Risk engine =====
+    // --- Risk engine ---
     const riskCheck = await preTradeRiskCheck(account_id, normSymbol, quantity);
     if (!riskCheck.ok)
       return res.status(400).json({ error: riskCheck.error });
 
-    // ===== Idempotency check =====
+    // --- Idempotency check ---
     if (idempotency_key) {
       const { data: existingOrder } = await supabase
         .from("orders")
         .select("id, created_at")
         .eq("idempotency_key", idempotency_key)
-        .single();
+        .maybeSingle();
       if (existingOrder) {
         return res.status(200).json({
           status: "duplicate",
           message: "Order already processed",
-          order_id: existingOrder.id
+          order_id: existingOrder.id,
         });
       }
     }
 
-    // ===== Market orders: fetch latest price =====
+    // --- Market orders need latest price ---
     let entryPrice = null;
     if (order_type.toLowerCase() === "market") {
       const cached = await getPriceFromRedis(normSymbol);
-      if (!cached?.price) return res.status(400).json({ error: "NO_LIVE_PRICE" });
+      if (!cached?.price)
+        return res.status(400).json({ error: "NO_LIVE_PRICE" });
       entryPrice = cached.price;
     }
 
-    // ===== Build order object =====
+    // --- Build order object ---
     const order = {
       id: uuidv4(),
       user_id,
       account_id,
       symbol: normSymbol,
       side: side.toLowerCase(),
-      size: Number(quantity),
-      type: order_type.toLowerCase(),
+      quantity: Number(quantity),
+      order_type: order_type.toLowerCase(),
       stop_loss: stop_loss ? Number(stop_loss) : null,
       take_profit: take_profit ? Number(take_profit) : null,
       limit_price: limit_price ? Number(limit_price) : null,
       entry_price: entryPrice,
       status: "pending",
       created_at: new Date().toISOString(),
-      idempotency_key: idempotency_key || null
+      idempotency_key: idempotency_key || null,
     };
 
-    // 🚀 Forward to MatchingEngine (handles persistence + execution)
+    // --- Persist order (pending) ---
+    const { error: insertErr } = await supabase.from("orders").insert([order]);
+    if (insertErr) {
+      console.error("❌ Supabase insert error:", insertErr.message);
+      return res.status(500).json({ error: "DB_INSERT_FAILED" });
+    }
+
+    // 🚀 Forward to MatchingEngine
     await placeOrder(order);
 
     console.log(
-      `✅ Order sent to matchingEngine: ${order.id} (${order.type.toUpperCase()} ${order.size} ${order.symbol})`
+      `✅ Order sent to matchingEngine: ${order.id} (${order.order_type.toUpperCase()} ${order.quantity} ${order.symbol})`
     );
 
     return res.json({
       status: "success",
       message:
-        order.type === "market"
+        order.order_type === "market"
           ? "Market order sent for execution"
           : `Limit order accepted at ${order.limit_price}`,
-      order_id: order.id
+      order_id: order.id,
     });
-
   } catch (err) {
-    console.error("❌ Error in /place-order:", err);
+    console.error("❌ Error in /place-order:", err.message, req.body);
     return res.status(500).json({ error: err.message });
   }
 });

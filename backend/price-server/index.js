@@ -6,6 +6,7 @@ const WebSocket = require("ws");
 const cors = require("cors");
 const url = require("url");
 const Redis = require("ioredis");
+const rateLimit = require("express-rate-limit");
 const dayjs = require("dayjs");
 const utc = require("dayjs/plugin/utc");
 const timezone = require("dayjs/plugin/timezone");
@@ -25,23 +26,17 @@ const FEED_API_KEY = process.env.FEED_API_KEY || "supersecret"; // 🔑 auth
 
 console.log("🔑 REDIS_URL =", redisUrl);
 console.log("🔑 SUPABASE_URL =", process.env.SUPABASE_URL);
-console.log("🔑 FINNHUB_API_KEY =", process.env.FINNHUB_API_KEY ? "[SET]" : "[MISSING]");
-console.log("🔑 FEED_API_KEY =", FEED_API_KEY);
 
-// ✅ Redis (resilient client)
-const redis = new Redis(redisUrl, {
-  maxRetriesPerRequest: null,
-  enableReadyCheck: true,
-  reconnectOnError: (err) => {
-    console.error("[ioredis] reconnectOnError:", err.message);
-    return true;
-  },
-  retryStrategy: (times) => Math.min(times * 200, 2000),
-});
+// ✅ Redis clients
+const redis = new Redis(redisUrl, { maxRetriesPerRequest: null });
+const redisSub = new Redis(redisUrl, { maxRetriesPerRequest: null });
 
 // ===== Logging =====
 function logEvent(type, msg, extra) {
-  console.log(`[${dayjs().format("YYYY-MM-DD HH:mm:ss")}] [${type}] ${msg}`, extra || "");
+  console.log(
+    `[${dayjs().format("YYYY-MM-DD HH:mm:ss")}] [${type}] ${msg}`,
+    extra || ""
+  );
 }
 
 // ===== Price Storage =====
@@ -56,11 +51,10 @@ const HISTORY_INTERVAL_MS = 1000;
 function bufferPrice(symbol, price, ts) {
   priceBuffer[symbol] = JSON.stringify({ price, ts });
 }
-
 async function flushPrices() {
   if (Object.keys(priceBuffer).length > 0) {
     try {
-      await redis.hmset("latest_prices", priceBuffer);
+      await redis.hset("latest_prices", priceBuffer);
       for (const k of Object.keys(priceBuffer)) delete priceBuffer[k];
     } catch (err) {
       logEvent("ERR", "Failed to flush prices to Redis", err.message);
@@ -81,16 +75,15 @@ async function saveTickHistoryThrottled(symbol, price, ts) {
     }
   }
 }
-
 async function getPrice(symbol) {
   try {
     const raw = await redis.hget("latest_prices", symbol);
     return raw ? JSON.parse(raw) : null;
-  } catch {
+  } catch (err) {
+    logEvent("ERR", `getPrice failed for ${symbol}`, err.message);
     return null;
   }
 }
-
 async function getRecentTicks(symbol, limit = 50) {
   const buf = getTicks(symbol);
   if (buf.length > 0) return buf.slice(-limit);
@@ -104,12 +97,10 @@ async function getRecentTicks(symbol, limit = 50) {
 }
 
 // ===== Redis Subscriber =====
-const redisSub = new Redis(redisUrl);
 redisSub.subscribe("price_ticks", (err) => {
   if (err) console.error("❌ Failed to subscribe:", err);
   else logEvent("START", "Subscribed to Redis channel: price_ticks");
 });
-
 redisSub.on("message", (channel, message) => {
   try {
     const tick = JSON.parse(message);
@@ -134,13 +125,20 @@ function throttledBroadcast(msg) {
   TPS_BUCKET.count++;
   broadcast(msg);
 }
-
 function broadcast(msg) {
   const data = JSON.stringify(msg);
   for (const client of wss.clients) {
     if (client.readyState !== WebSocket.OPEN) continue;
-    if (!client.subscriptions || client.subscriptions.size === 0 || client.subscriptions.has(msg.symbol)) {
-      client.send(data);
+    if (
+      !client.subscriptions ||
+      client.subscriptions.size === 0 ||
+      client.subscriptions.has(msg.symbol)
+    ) {
+      if (client.bufferedAmount < 1e6) {
+        client.send(data);
+      } else {
+        logEvent("WARN", "WS client buffer overflow, dropping msg");
+      }
     }
   }
 }
@@ -149,11 +147,24 @@ function broadcast(msg) {
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Rate limit: 100 req / 15 min per IP
+app.use(
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 100,
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
+
 app.use("/place-order", placeOrderRoute);
 
 app.get("/prices", async (req, res) => {
   try {
-    const symbols = Array.from(WHITELIST);
+    const symbols =
+      req.query.symbols?.split(",").map((s) => normalizeSymbol(s)) ||
+      Array.from(WHITELIST);
     const prices = {};
     for (const sym of symbols) {
       let val = await getPrice(sym);
@@ -187,7 +198,7 @@ server.on("upgrade", (req, socket, head) => {
   const token = protocolKey || queryKey;
 
   if (token !== FEED_API_KEY) {
-    logEvent("AUTH", "Rejected WS connection (bad key)");
+    logEvent("AUTH", `Rejected WS connection from ${req.socket.remoteAddress}`);
     socket.destroy();
     return;
   }
@@ -197,11 +208,11 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 // ===== Handle WS connections =====
-wss.on("connection", async (ws) => {
+wss.on("connection", async (ws, req) => {
   ws.isAlive = true;
   ws.subscriptions = new Set();
   ws.on("pong", heartbeat);
-  logEvent("WS", "Client connected");
+  logEvent("WS", `Client connected from ${req.socket.remoteAddress}`);
 
   ws.send(JSON.stringify({ type: "welcome", symbols: Array.from(WHITELIST) }));
 
@@ -210,6 +221,10 @@ wss.on("connection", async (ws) => {
       const data = JSON.parse(msg.toString());
       if (data.type === "subscribe" && data.symbol) {
         const sym = normalizeSymbol(data.symbol);
+        if (!WHITELIST.has(sym)) {
+          ws.send(JSON.stringify({ type: "error", error: "Symbol not allowed" }));
+          return;
+        }
         ws.subscriptions.add(sym);
         ws.send(JSON.stringify({ type: "subscribed", symbol: sym }));
       }
@@ -223,11 +238,18 @@ wss.on("connection", async (ws) => {
     }
   });
 
+  ws.on("close", () => {
+    logEvent("WS", `Client disconnected from ${req.socket.remoteAddress}`);
+    ws.subscriptions.clear();
+  });
+
+  // send snapshot
   for (const sym of WHITELIST) {
     const cached = await getPrice(sym);
     if (cached) ws.send(JSON.stringify({ type: "price", symbol: sym, ...cached }));
     const history = await getRecentTicks(sym, 50);
-    if (history.length) ws.send(JSON.stringify({ type: "history", symbol: sym, ticks: history }));
+    if (history.length)
+      ws.send(JSON.stringify({ type: "history", symbol: sym, ticks: history }));
   }
 });
 
@@ -244,8 +266,12 @@ setInterval(() => {
 process.on("SIGINT", async () => {
   logEvent("STOP", "Shutting down Price Server...");
   await redis.quit();
+  await redisSub.quit();
   server.close(() => process.exit(0));
 });
-
-process.on("unhandledRejection", (err) => logEvent("FATAL", "UnhandledRejection", err));
-process.on("uncaughtException", (err) => logEvent("FATAL", "UncaughtException", err));
+process.on("unhandledRejection", (err) =>
+  logEvent("FATAL", "UnhandledRejection", err)
+);
+process.on("uncaughtException", (err) =>
+  logEvent("FATAL", "UncaughtException", err)
+);

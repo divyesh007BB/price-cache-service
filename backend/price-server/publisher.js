@@ -1,4 +1,4 @@
-// publisher.js — Binance Feed → Redis Pub/Sub
+// publisher.js — Binance Feed → Redis Pub/Sub (Production Ready)
 
 require("dotenv").config();
 const WebSocket = require("ws");
@@ -92,5 +92,12 @@ async function startFeeds() {
   }
   logEvent("START", `Publisher started for ${BINANCE_PAIRS.join(", ")}`);
 }
+
+// ===== Graceful Shutdown =====
+process.on("SIGINT", async () => {
+  logEvent("STOP", "Shutting down Publisher...");
+  await redis.quit();
+  process.exit(0);
+});
 
 startFeeds();

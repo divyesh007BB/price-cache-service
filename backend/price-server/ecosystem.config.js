@@ -4,8 +4,8 @@ module.exports = {
   apps: [
     {
       name: "price-server",
-      script: "index.js",
-      cwd: "backend/price-server",   // ✅ ensure correct working dir
+      script: "backend/price-server/index.js", // ✅ correct path
+      cwd: "/opt/price-cache-service",
       instances: 1,
       autorestart: true,
       watch: false,
@@ -49,14 +49,31 @@ module.exports = {
     },
     {
       name: "publisher",
-      script: "publisher.js",
-      cwd: "backend/price-server",   // ✅ run inside correct folder
+      script: "backend/price-server/publisher.js", // ✅ correct path
+      cwd: "/opt/price-cache-service",
       instances: 1,
       autorestart: true,
       watch: false,
       max_memory_restart: "512M",
       env: {
         NODE_ENV: "production",
+        REDIS_URL:
+          "redis://default:TwrqXDnDNLAScrFoGoBusDVsHURqveIx@redis.railway.internal:6379",
+      },
+    },
+    {
+      name: "matching-engine",
+      script: "backend/matching-engine/matchingEngine.js", // ✅ correct path
+      cwd: "/opt/price-cache-service",
+      instances: 1,
+      autorestart: true,
+      watch: false,
+      max_memory_restart: "1G",
+      env: {
+        NODE_ENV: "production",
+        SUPABASE_URL: "https://bqagmucrlzinexnjabvf.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY:
+          "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJxYWdtdWNybHppbmV4bmphYnZmIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NDkwNjQ3MCwiZXhwIjoyMDcwNDgyNDcwfQ.y8Yp1RM6T7VHCISICktyAR48rVX068i_xpdVYXyn5kY",
         REDIS_URL:
           "redis://default:TwrqXDnDNLAScrFoGoBusDVsHURqveIx@redis.railway.internal:6379",
       },

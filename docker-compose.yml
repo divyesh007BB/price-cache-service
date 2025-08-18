@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   # ===========================
   # KeyDB (Redis-compatible)
@@ -15,9 +13,41 @@ services:
     command: keydb-server --appendonly yes --save "60 1"
     networks:
       - aroha-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # ===========================
-  # Price Server
+  # Publisher (Binance → Redis)
+  # ===========================
+  publisher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aroha-publisher
+    restart: unless-stopped
+    working_dir: /app/backend/price-server
+    env_file:
+      - ./backend/price-server/.env
+    environment:
+      - NODE_ENV=production
+      - REDIS_URL=redis://keydb:6379
+    depends_on:
+      keydb:
+        condition: service_healthy
+    command: ["pm2-runtime", "publisher.js"]
+    networks:
+      - aroha-net
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('./publisher.js')\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ===========================
+  # Price Server (WS + REST API)
   # ===========================
   price-server:
     build:
@@ -33,12 +63,20 @@ services:
       - NODE_ENV=production
       - REDIS_URL=redis://keydb:6379
     depends_on:
-      - keydb
+      keydb:
+        condition: service_healthy
+      publisher:
+        condition: service_healthy
     ports:
       - "4000:4000"
-    command: ["node", "index.js"]
+    command: ["pm2-runtime", "index.js"]
     networks:
       - aroha-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/prices || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
 
   # ===========================
   # Matching Engine
@@ -56,11 +94,20 @@ services:
       - NODE_ENV=production
       - REDIS_URL=redis://keydb:6379
     depends_on:
-      - keydb
-      - price-server
-    command: ["node", "matchingEngine.js"]
+      keydb:
+        condition: service_healthy
+      publisher:
+        condition: service_healthy
+      price-server:
+        condition: service_healthy
+    command: ["pm2-runtime", "matchingEngine.js"]
     networks:
       - aroha-net
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('./matchingEngine.js')\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
 
 volumes:
   keydb_data:

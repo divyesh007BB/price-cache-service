@@ -1,6 +1,11 @@
 // state.js — Shared in-memory state between price server and order routes
 // Redis handles all live prices; this file only stores tick history & tradable symbol whitelist
 
+// ===== Config =====
+const DEFAULT_TICK_LIMIT = process.env.TICK_HISTORY_LIMIT
+  ? parseInt(process.env.TICK_HISTORY_LIMIT, 10)
+  : 50;
+
 // ===== In-memory structures =====
 const WHITELIST = new Set(); // Allowed tradable symbols (normalized)
 const tickBuffers = new Map(); // symbol -> array of { ts, price }
@@ -11,7 +16,7 @@ function norm(sym) {
 }
 
 // ===== Tick handling =====
-function addTick(symbol, price, ts, limit = 50) {
+function addTick(symbol, price, ts, limit = DEFAULT_TICK_LIMIT) {
   const sym = norm(symbol);
   if (!sym || typeof price !== "number" || !Number.isFinite(price)) return; // skip invalid ticks
 
@@ -39,6 +44,7 @@ function setWhitelist(symbols = []) {
 }
 
 // ===== Initialize Default Whitelist =====
+// ⚠️ In production, this should be set dynamically from DB instruments
 setWhitelist(["BTCUSD", "ETHUSD", "XAUUSD"]);
 
 // ===== Exports =====
@@ -48,5 +54,5 @@ module.exports = {
   addTick,
   getTicks,
   setWhitelist,
-  norm, // exported for reuse
+  norm,
 };
