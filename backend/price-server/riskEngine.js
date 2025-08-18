@@ -5,34 +5,14 @@ require("dotenv").config();
 const dns = require("dns").promises;
 const Redis = require("ioredis");
 
-// ✅ Import matchingEngine and supabase
-const matchingEngine = require("../matching-engine/matchingEngine");
 const { supabaseClient: supabase } = require("../shared/supabaseClient");
 const { getContracts } = require("../shared/symbolMap");
 
-// ---- Safe wrappers (use matchingEngine exports) ----
-function getOpenTrades() {
-  return typeof matchingEngine.getOpenTrades === "function"
-    ? matchingEngine.getOpenTrades()
-    : [];
-}
+// ✅ Use tradeState for getters (avoids circular dependency)
+const { getOpenTrades, getAccounts } = require("../matching-engine/tradeState");
 
-function getAccounts() {
-  return typeof matchingEngine.getAccounts === "function"
-    ? matchingEngine.getAccounts()
-    : [];
-}
-
-async function closeTrade(trade, exitPrice, reason) {
-  if (typeof matchingEngine.closeTrade === "function") {
-    return matchingEngine.closeTrade(trade, exitPrice, reason);
-  }
-  console.warn("⚠ closeTrade not found on matchingEngine, skipping");
-  return null;
-}
-
-// Debug log to confirm exports
-console.log("🔍 matchingEngine keys:", Object.keys(matchingEngine));
+// ✅ Import only closeTrade from matchingEngine
+const { closeTrade } = require("../matching-engine/matchingEngine");
 
 const SLTP_GRACE_MS = 1000;
 
@@ -51,8 +31,8 @@ const SLTP_GRACE_MS = 1000;
 const redisUrl = process.env.REDIS_URL;
 const sub = new Redis(redisUrl);
 
-// Subscribe to prices, trades, and orders
-sub.subscribe("price:*", "trade_events", "order_events", (err, count) => {
+// Use psubscribe for wildcards
+sub.psubscribe("price:*", "trade_events", "order_events", (err, count) => {
   if (err) {
     console.error("❌ Failed to subscribe to Redis:", err);
   } else {
@@ -60,22 +40,18 @@ sub.subscribe("price:*", "trade_events", "order_events", (err, count) => {
   }
 });
 
-sub.on("message", async (channel, message) => {
+sub.on("pmessage", async (pattern, channel, message) => {
   try {
     if (!message) return;
     const event = JSON.parse(message);
 
-    // Price update → run continuous risk checks
     if (channel.startsWith("price:")) {
       const { symbol, price } = event;
       await evaluateOpenPositions(symbol, price);
     }
 
-    // Trade lifecycle events
     if (channel === "trade_events") {
       console.log("📡 Trade Event:", event.type, event);
-
-      // ✅ Log to Supabase audit table
       await supabase.from("trade_audit").insert({
         account_id: event.account_id,
         trade_id: event.trade_id || null,
@@ -84,17 +60,19 @@ sub.on("message", async (channel, message) => {
         size: event.size,
         price: event.execPrice,
         pnl: event.pnl || null,
-        event_type: event.type, // e.g. "TRADE_OPEN", "TRADE_CLOSE"
+        event_type: event.type,
         raw_event: event,
         created_at: new Date().toISOString()
       });
+
+      // ✅ Run immediate risk check on fills
+      if (event.type === "TRADE_OPEN") {
+        await evaluateImmediateRisk(event.account_id, event.symbol, event.size, event.execPrice);
+      }
     }
 
-    // Order lifecycle events
     if (channel === "order_events") {
       console.log("📡 Order Event:", event.type, event);
-
-      // ✅ Log to Supabase audit table
       await supabase.from("order_audit").insert({
         account_id: event.account_id,
         order_id: event.order_id || null,
@@ -103,7 +81,7 @@ sub.on("message", async (channel, message) => {
         size: event.size,
         order_type: event.order_type,
         price: event.limit_price || event.execPrice || null,
-        status: event.status, // e.g. "NEW", "FILLED", "CANCELLED", "REJECTED"
+        status: event.status,
         reason: event.reason || null,
         event_type: event.type,
         raw_event: event,
@@ -135,7 +113,7 @@ async function supabaseQueryWithRetry(queryFn, retries = 5, delayMs = 300) {
 
 // ✅ Slippage model
 function applySlippage(entryPrice, tickPrice, side, liquidityGap = 0) {
-  let slippage = entryPrice * 0.0001; // base 0.01%
+  let slippage = entryPrice * 0.0001;
   if (liquidityGap > 0) slippage += liquidityGap * 0.25;
   return side === "buy" ? tickPrice + slippage : tickPrice - slippage;
 }
@@ -196,16 +174,16 @@ async function evaluateImmediateRisk(accountId, symbol, size, execPrice) {
       return { ok: false, error: "MAX_LOT_SIZE" };
     }
 
-    // ✅ Static Max Loss
     if (account.max_loss && account.current_balance <= account.start_balance - account.max_loss) {
+      console.log(`💀 Account ${account.id} FAILED MAX LOSS on fill`);
       return { ok: false, error: "MAX_LOSS" };
     }
 
-    // ✅ Trailing Drawdown
     if (account.trail_drawdown) {
       const peak = account.peak_balance || account.start_balance;
       const ddFloor = Math.max(account.start_balance - account.trail_drawdown, peak - account.trail_drawdown);
       if (account.current_balance <= ddFloor) {
+        console.log(`💀 Account ${account.id} FAILED TRAILING DD on fill`);
         return { ok: false, error: "TRAILING_DRAWDOWN" };
       }
     }
@@ -227,43 +205,43 @@ async function evaluateOpenPositions(symbol, tickPrice) {
     if (!contract) return;
 
     // ---- SL/TP checks ----
-    for (const pos of openPositions) {
-      if (pos.symbol !== symbol) continue;
-      if (now - new Date(pos.time_opened).getTime() < SLTP_GRACE_MS) continue;
+    await Promise.all(
+      openPositions.map(async (pos) => {
+        if (pos.symbol !== symbol) return;
+        if (now - new Date(pos.time_opened).getTime() < SLTP_GRACE_MS) return;
 
-      let shouldClose = false;
-      let reason = null;
+        let shouldClose = false;
+        let reason = null;
 
-      if (pos.stop_loss != null &&
-        ((pos.side === "buy" && tickPrice <= pos.stop_loss) ||
-         (pos.side === "sell" && tickPrice >= pos.stop_loss))) {
-        shouldClose = true; reason = "SL Hit";
-      }
+        if (pos.stop_loss != null &&
+          ((pos.side === "buy" && tickPrice <= pos.stop_loss) ||
+           (pos.side === "sell" && tickPrice >= pos.stop_loss))) {
+          shouldClose = true; reason = "SL Hit";
+        }
 
-      if (!shouldClose &&
-        pos.take_profit != null &&
-        ((pos.side === "buy" && tickPrice >= pos.take_profit) ||
-         (pos.side === "sell" && tickPrice <= pos.take_profit))) {
-        shouldClose = true; reason = "TP Hit";
-      }
+        if (!shouldClose &&
+          pos.take_profit != null &&
+          ((pos.side === "buy" && tickPrice >= pos.take_profit) ||
+           (pos.side === "sell" && tickPrice <= pos.take_profit))) {
+          shouldClose = true; reason = "TP Hit";
+        }
 
-      if (shouldClose) {
-        const exitPx = applySlippage(pos.entry_price, tickPrice, pos.side);
-        console.log(`📉 ${reason} — Closing ${pos.id} @ ${exitPx}`);
-        await closeTrade(pos, exitPx, reason);
-      }
-    }
+        if (shouldClose) {
+          const exitPx = applySlippage(pos.entry_price, tickPrice, pos.side);
+          console.log(`📉 ${reason} — Closing ${pos.id} @ ${exitPx}`);
+          await closeTrade(pos, exitPx, reason);
+        }
+      })
+    );
 
     // ---- Account-level checks ----
     for (const acc of accounts) {
       if (acc.status === "blown") continue;
 
-      // Static Max Loss
       if (acc.max_loss && acc.current_balance <= acc.start_balance - acc.max_loss) {
         await handleBreach(acc, tickPrice, "MAX_LOSS"); continue;
       }
 
-      // Daily Loss Limit
       if (acc.daily_loss_limit && acc.daily_loss_limit > 0) {
         const today = new Date().toISOString().split("T")[0];
         const trades = await supabaseQueryWithRetry(() =>
@@ -279,7 +257,6 @@ async function evaluateOpenPositions(symbol, tickPrice) {
         }
       }
 
-      // Trailing Drawdown
       if (acc.trail_drawdown) {
         let ddLevel;
         if (acc.status === "passed" || acc.trailing_dd_mode === "FROZEN") {
@@ -298,7 +275,6 @@ async function evaluateOpenPositions(symbol, tickPrice) {
         }
       }
 
-      // Consistency Rule
       const bestDay = acc.best_day_profit || 0;
       const consistencyViolated = acc.profit_target > 0 && bestDay > acc.profit_target * 0.5;
 
@@ -318,13 +294,12 @@ async function evaluateOpenPositions(symbol, tickPrice) {
         acc.consistency_flag = false;
       }
 
-      // Profit Target
       if (acc.total_profit >= acc.profit_target && !["passed", "blown"].includes(acc.status)) {
         if (acc.consistency_flag) {
           console.log(`🚧 Profit target hit but consistency violated for ${acc.id}`);
           continue;
         }
-        console.log(`🏆 Profit target + consistency achieved for ${acc.id}`);
+        console.log(`🏆 Account ${acc.id} PASSED — Profit target + consistency achieved!`);
         await supabase.from("accounts").update({ status: "passed", trailing_dd_mode: "FROZEN" }).eq("id", acc.id);
       }
     }
@@ -334,7 +309,7 @@ async function evaluateOpenPositions(symbol, tickPrice) {
 }
 
 async function handleBreach(account, tickPrice, reason) {
-  console.log(`💀 ${reason} breached for account ${account.id} — marking blown`);
+  console.log(`💀 Account ${account.id} BLOWN — Reason: ${reason}`);
   await supabase.from("accounts").update({ status: "blown", blown_reason: reason }).eq("id", account.id);
 
   const openForAcc = getOpenTrades().filter((p) => p.account_id === account.id);
