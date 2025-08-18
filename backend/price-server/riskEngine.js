@@ -4,7 +4,7 @@
 require("dotenv").config();
 const dns = require("dns").promises;
 
-// ✅ FIXED path (one level up, not two)
+// ✅ Correct import paths
 const { supabaseClient: supabase } = require("../shared/supabaseClient");
 const { getOpenTrades, getAccounts, closeTrade } = require("../matching-engine/matchingEngine");
 const { getContracts } = require("../shared/symbolMap");

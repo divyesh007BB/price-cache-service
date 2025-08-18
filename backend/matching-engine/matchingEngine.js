@@ -16,7 +16,7 @@ const { addTick } = require("../shared/state");
 const { markSymbolActive, markSymbolInactive } = require("./feedControl");
 const { supabaseClient: supabase } = require("../shared/supabaseClient");
 
-// ✅ Centralized risk logic (from riskEngine.js)
+// ✅ Centralized risk logic
 const { evaluateOpenPositions, preTradeRiskCheck, evaluateImmediateRisk } = require("../price-server/riskEngine");
 
 // ---------- Local State ----------
@@ -109,7 +109,7 @@ function broadcastSnapshot() {
 // ===================================
 async function subscribePriceFeed() {
   const sub = redis.duplicate();
-  await sub.subscribe("price_ticks"); // ✅ FIXED channel name
+  await sub.subscribe("price_ticks");
   sub.on("message", (ch, msg) => {
     if (ch === "price_ticks") {
       const { symbol, price, ts } = JSON.parse(msg);
@@ -338,7 +338,7 @@ async function fillOrder(order, basePrice, prevPrice) {
       await auditLog("ORDER_FILLED", { order, trade });
 
       if (remainingQty > 0) {
-        const restOrder = { ...order, id: uuidv4(), quantity: remainingQty }; // ✅ new id
+        const restOrder = { ...order, id: uuidv4(), quantity: remainingQty };
         pendingOrders.push(restOrder);
         try {
           wsBroadcast({ type: "order_pending", order: restOrder });
@@ -396,7 +396,7 @@ async function closeTrade(trade, closePrice) {
     if (sess.realized > sess.bestDay) sess.bestDay = sess.realized;
     sessionPnL.set(acc.id, sess);
 
-    accounts.set(acc.id, acc); // ✅ ensure saved
+    accounts.set(acc.id, acc);
     try {
       wsBroadcast({ type: "account_update", account: acc });
     } catch {}
