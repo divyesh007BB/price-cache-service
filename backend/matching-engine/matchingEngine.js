@@ -190,7 +190,7 @@ async function processTick(symbol, price) {
     return (t.stop_loss != null && price >= t.stop_loss) ||
            (t.take_profit != null && price <= t.take_profit);
   });
-  for (const t of toClose) await closeTrade(t, price);
+  for (const t of toClose) await closeTrade(t, price, "SLTP Trigger");
 
   await evaluateOpenPositions(norm, price);
 }
@@ -351,7 +351,7 @@ async function fillOrder(order, basePrice, prevPrice) {
 // ===================================
 // CLOSE TRADE
 // ===================================
-async function closeTrade(trade, closePrice) {
+async function closeTrade(trade, closePrice, reason = null) {
   const tickValue = getContracts()[trade.symbol]?.tickValue ?? 1;
   const pnl = trade.side === "buy"
     ? (closePrice - trade.entry_price) * trade.quantity * tickValue
@@ -364,6 +364,7 @@ async function closeTrade(trade, closePrice) {
     status: "closed",
     exit_price: closePrice,
     pnl: netPnL,
+    exit_reason: reason || trade.exit_reason || null,
     time_closed: new Date().toISOString(),
   };
 
@@ -380,6 +381,7 @@ async function closeTrade(trade, closePrice) {
         status: "closed",
         exit_price: closePrice,
         closed_at: new Date().toISOString(),
+        exit_reason: reason || null,
       }).eq("id", trade.order_id);
     }
   } catch (err) {
@@ -416,7 +418,7 @@ async function closeTrade(trade, closePrice) {
     openTrades.some((t) => t.symbol === trade.symbol);
   if (!stillActive) markSymbolInactive(trade.symbol);
 
-  await auditLog("TRADE_CLOSED", { trade: closed });
+  await auditLog("TRADE_CLOSED", { trade: closed, reason });
 }
 
 // ===================================
@@ -454,6 +456,21 @@ async function convertPrice(symbol, price) {
 }
 
 // ===================================
+// GETTERS
+// ===================================
+function getOpenTrades() {
+  return openTrades;
+}
+
+function getPendingOrders() {
+  return pendingOrders;
+}
+
+function getAccounts() {
+  return Array.from(accounts.values());
+}
+
+// ===================================
 // EXPORTS
 // ===================================
 module.exports = {
@@ -463,4 +480,7 @@ module.exports = {
   placeOrder,
   fillOrder,
   closeTrade,
+  getOpenTrades,
+  getPendingOrders,
+  getAccounts,
 };

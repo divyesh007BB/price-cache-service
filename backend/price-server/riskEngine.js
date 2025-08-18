@@ -4,10 +4,16 @@
 require("dotenv").config();
 const dns = require("dns").promises;
 
-// ✅ Correct import paths
+// ✅ Correct import paths (case-sensitive fix)
+const matchingEngine = require("../matching-engine/matchingEngine");
 const { supabaseClient: supabase } = require("../shared/supabaseClient");
-const { getOpenTrades, getAccounts, closeTrade } = require("../matching-engine/matchingEngine");
 const { getContracts } = require("../shared/symbolMap");
+
+// Destructure with safety
+const { getOpenTrades, getAccounts, closeTrade } = matchingEngine;
+
+// Debug log to confirm exports
+console.log("🔍 matchingEngine exports:", Object.keys(matchingEngine));
 
 const SLTP_GRACE_MS = 1000;
 
