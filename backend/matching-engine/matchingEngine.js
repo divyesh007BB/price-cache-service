@@ -19,6 +19,9 @@ const { supabaseClient: supabase } = require("../shared/supabaseClient");
 // ✅ Centralized risk logic
 const { evaluateOpenPositions, preTradeRiskCheck, evaluateImmediateRisk } = require("../price-server/riskEngine");
 
+// ✅ Hook getters
+const { registerGetters } = require("./getters");
+
 // ---------- Local State ----------
 let wsBroadcast = () => {};
 let accounts = new Map();
@@ -484,3 +487,10 @@ module.exports = {
   getPendingOrders,
   getAccounts,
 };
+
+// ✅ Register with getters.js
+registerGetters({
+  _getOpenTrades: getOpenTrades,
+  _getAccounts: getAccounts,
+  _closeTrade: closeTrade,
+});

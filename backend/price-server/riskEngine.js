@@ -4,16 +4,34 @@
 require("dotenv").config();
 const dns = require("dns").promises;
 
-// ✅ Correct import paths (case-sensitive fix)
+// ✅ Import matchingEngine and supabase
 const matchingEngine = require("../matching-engine/matchingEngine");
 const { supabaseClient: supabase } = require("../shared/supabaseClient");
 const { getContracts } = require("../shared/symbolMap");
 
-// Destructure with safety
-const { getOpenTrades, getAccounts, closeTrade } = matchingEngine;
+// ---- Safe wrappers (use matchingEngine exports) ----
+function getOpenTrades() {
+  return typeof matchingEngine.getOpenTrades === "function"
+    ? matchingEngine.getOpenTrades()
+    : [];
+}
+
+function getAccounts() {
+  return typeof matchingEngine.getAccounts === "function"
+    ? matchingEngine.getAccounts()
+    : [];
+}
+
+async function closeTrade(trade, exitPrice, reason) {
+  if (typeof matchingEngine.closeTrade === "function") {
+    return matchingEngine.closeTrade(trade, exitPrice, reason);
+  }
+  console.warn("⚠ closeTrade not found on matchingEngine, skipping");
+  return null;
+}
 
 // Debug log to confirm exports
-console.log("🔍 matchingEngine exports:", Object.keys(matchingEngine));
+console.log("🔍 matchingEngine keys:", Object.keys(matchingEngine));
 
 const SLTP_GRACE_MS = 1000;
 
