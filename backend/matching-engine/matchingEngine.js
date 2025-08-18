@@ -16,7 +16,8 @@ const { addTick } = require("../shared/state");
 const { markSymbolActive, markSymbolInactive } = require("./feedControl");
 const { supabaseClient: supabase } = require("../shared/supabaseClient");
 
-const { evaluateOpenPositions, preTradeRiskCheck } = require("../price-server/riskEngine");
+// ✅ Centralized risk logic (from riskEngine.js)
+const { evaluateOpenPositions, preTradeRiskCheck, evaluateImmediateRisk } = require("../price-server/riskEngine");
 
 // ---------- Local State ----------
 let wsBroadcast = () => {};
@@ -416,23 +417,6 @@ async function closeTrade(trade, closePrice) {
   if (!stillActive) markSymbolInactive(trade.symbol);
 
   await auditLog("TRADE_CLOSED", { trade: closed });
-}
-
-// ===================================
-// RISK CHECK
-// ===================================
-async function evaluateImmediateRisk(account_id, symbol, qty, execPrice) {
-  const acc = accounts.get(account_id);
-  if (!acc) return { ok: false, error: "ACCOUNT_NOT_FOUND" };
-
-  if (acc.current_balance <= (acc.initial_balance - acc.max_loss)) {
-    return { ok: false, error: "MAX_LOSS_REACHED" };
-  }
-  const sess = sessionPnL.get(account_id);
-  if (sess && sess.realized <= -Math.abs(acc.daily_loss_limit)) {
-    return { ok: false, error: "DAILY_LOSS_LIMIT" };
-  }
-  return { ok: true };
 }
 
 // ===================================
