@@ -108,15 +108,20 @@ function broadcastSnapshot() {
 }
 
 // ===================================
-// PRICE SUBSCRIPTION
+// PRICE SUBSCRIPTION (Redis Pub/Sub)
 // ===================================
 async function subscribePriceFeed() {
   const sub = redis.duplicate();
   await sub.subscribe("price_ticks");
-  sub.on("message", (ch, msg) => {
+  sub.on("message", async (ch, msg) => {
     if (ch === "price_ticks") {
-      const { symbol, price, ts } = JSON.parse(msg);
-      latestPrices[symbol] = { price, ts };
+      try {
+        const { symbol, price, ts } = JSON.parse(msg);
+        latestPrices[symbol] = { price, ts };
+        await processTick(symbol, price);
+      } catch (err) {
+        console.error("❌ Failed to process price tick:", err);
+      }
     }
   });
   console.log("📡 Subscribed to Redis/KeyDB 'price_ticks'");
@@ -253,6 +258,7 @@ async function placeOrder(order) {
     pendingOrders.push(newOrder);
     try {
       wsBroadcast({ type: "order_pending", order: newOrder });
+      await redis.publish("order_events", JSON.stringify({ type: "ORDER_PENDING", order: newOrder }));
     } catch {}
     broadcastSnapshot();
     try {
@@ -324,6 +330,8 @@ async function fillOrder(order, basePrice, prevPrice) {
       openTrades.push(trade);
       try {
         wsBroadcast({ type: "trade_fill", trade });
+        await redis.publish("trade_events", JSON.stringify({ type: "TRADE_OPENED", trade }));
+        await redis.publish("order_events", JSON.stringify({ type: "ORDER_FILLED", order, trade }));
       } catch {}
       broadcastSnapshot();
 
@@ -345,6 +353,7 @@ async function fillOrder(order, basePrice, prevPrice) {
         pendingOrders.push(restOrder);
         try {
           wsBroadcast({ type: "order_pending", order: restOrder });
+          await redis.publish("order_events", JSON.stringify({ type: "ORDER_PENDING", order: restOrder }));
         } catch {}
       }
     })
@@ -374,6 +383,7 @@ async function closeTrade(trade, closePrice, reason = null) {
   openTrades = openTrades.filter((t) => t.id !== trade.id);
   try {
     wsBroadcast({ type: "trade_close", trade: closed });
+    await redis.publish("trade_events", JSON.stringify({ type: "TRADE_CLOSED", trade: closed, reason }));
   } catch {}
   broadcastSnapshot();
 
@@ -430,6 +440,7 @@ async function closeTrade(trade, closePrice, reason = null) {
 function rejectOrder(order, reason) {
   try {
     wsBroadcast({ type: "order_reject", order, reason });
+    redis.publish("order_events", JSON.stringify({ type: "ORDER_REJECTED", order, reason }));
   } catch {}
   auditLog("ORDER_REJECTED", { order, reason });
   return { ok: false, reason };

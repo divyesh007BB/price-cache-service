@@ -3,6 +3,7 @@
 
 require("dotenv").config();
 const dns = require("dns").promises;
+const Redis = require("ioredis");
 
 // ✅ Import matchingEngine and supabase
 const matchingEngine = require("../matching-engine/matchingEngine");
@@ -45,6 +46,74 @@ const SLTP_GRACE_MS = 1000;
     console.error("❌ DNS resolution failed:", e.message || e);
   }
 })();
+
+// ---- Redis Pub/Sub ----
+const redisUrl = process.env.REDIS_URL;
+const sub = new Redis(redisUrl);
+
+// Subscribe to prices, trades, and orders
+sub.subscribe("price:*", "trade_events", "order_events", (err, count) => {
+  if (err) {
+    console.error("❌ Failed to subscribe to Redis:", err);
+  } else {
+    console.log(`📡 RiskEngine subscribed to ${count} channel(s)`);
+  }
+});
+
+sub.on("message", async (channel, message) => {
+  try {
+    if (!message) return;
+    const event = JSON.parse(message);
+
+    // Price update → run continuous risk checks
+    if (channel.startsWith("price:")) {
+      const { symbol, price } = event;
+      await evaluateOpenPositions(symbol, price);
+    }
+
+    // Trade lifecycle events
+    if (channel === "trade_events") {
+      console.log("📡 Trade Event:", event.type, event);
+
+      // ✅ Log to Supabase audit table
+      await supabase.from("trade_audit").insert({
+        account_id: event.account_id,
+        trade_id: event.trade_id || null,
+        symbol: event.symbol,
+        side: event.side,
+        size: event.size,
+        price: event.execPrice,
+        pnl: event.pnl || null,
+        event_type: event.type, // e.g. "TRADE_OPEN", "TRADE_CLOSE"
+        raw_event: event,
+        created_at: new Date().toISOString()
+      });
+    }
+
+    // Order lifecycle events
+    if (channel === "order_events") {
+      console.log("📡 Order Event:", event.type, event);
+
+      // ✅ Log to Supabase audit table
+      await supabase.from("order_audit").insert({
+        account_id: event.account_id,
+        order_id: event.order_id || null,
+        symbol: event.symbol,
+        side: event.side,
+        size: event.size,
+        order_type: event.order_type,
+        price: event.limit_price || event.execPrice || null,
+        status: event.status, // e.g. "NEW", "FILLED", "CANCELLED", "REJECTED"
+        reason: event.reason || null,
+        event_type: event.type,
+        raw_event: event,
+        created_at: new Date().toISOString()
+      });
+    }
+  } catch (err) {
+    console.error("❌ Redis message parse error:", err.message || err);
+  }
+});
 
 // ---- Retry wrapper ----
 async function supabaseQueryWithRetry(queryFn, retries = 5, delayMs = 300) {
