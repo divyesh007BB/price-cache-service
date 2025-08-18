@@ -19,14 +19,20 @@ const { supabaseClient: supabase } = require("../shared/supabaseClient");
 // ✅ Centralized risk logic
 const { evaluateOpenPositions, preTradeRiskCheck, evaluateImmediateRisk } = require("../price-server/riskEngine");
 
-// ✅ Hook getters
-const { registerGetters } = require("./getters");
+// ✅ Shared trade/account state
+const {
+  getOpenTrades,
+  setOpenTrades,
+  getAccounts,
+  setAccounts,
+  addOpenTrade,
+  removeOpenTrade,
+  updateAccount,
+} = require("./tradeState");
 
 // ---------- Local State ----------
 let wsBroadcast = () => {};
-let accounts = new Map();
 let pendingOrders = [];
-let openTrades = [];
 let sessionPnL = new Map();
 let recentOrders = new Set();
 let accountLocks = new Map();
@@ -61,8 +67,9 @@ async function loadInitialData() {
 
   const { data: accData, error: accErr } = await supabase.from("accounts").select("*");
   if (accErr) throw accErr;
+  const accMap = new Map();
   accData.forEach((acc) => {
-    accounts.set(acc.id, acc);
+    accMap.set(acc.id, acc);
     sessionPnL.set(acc.id, {
       day: todayStr(),
       realized: 0,
@@ -70,12 +77,13 @@ async function loadInitialData() {
       total: acc.total_profit ?? 0,
     });
   });
+  setAccounts(Array.from(accMap.values()));
 
   const { data: poData } = await supabase.from("orders").select("*").eq("status", "pending");
   pendingOrders = poData || [];
 
   const { data: otData } = await supabase.from("trades").select("*").eq("is_open", true);
-  openTrades = otData || [];
+  setOpenTrades(otData || []);
 
   try {
     const all = await redis.hgetall("latest_prices");
@@ -88,7 +96,9 @@ async function loadInitialData() {
   }
 
   subscribePriceFeed();
-  console.log(`✅ Loaded ${accounts.size} accounts, ${pendingOrders.length} pending orders, ${openTrades.length} open trades`);
+  console.log(
+    `✅ Loaded ${getAccounts().length} accounts, ${pendingOrders.length} pending orders, ${getOpenTrades().length} open trades`
+  );
   broadcastSnapshot();
 }
 
@@ -100,9 +110,9 @@ function broadcastSnapshot() {
   try {
     wsBroadcast({
       type: "sync_state",
-      accounts: Array.from(accounts.values()),
+      accounts: getAccounts(),
       pendingOrders,
-      openTrades,
+      openTrades: getOpenTrades(),
     });
   } catch {}
 }
@@ -166,13 +176,16 @@ async function processTick(symbol, price) {
   } catch {}
 
   // Update unrealized PnL
-  accounts.forEach((acc) => {
-    const accTrades = openTrades.filter((t) => t.account_id === acc.id);
+  getAccounts().forEach((acc) => {
+    const accTrades = getOpenTrades().filter((t) => t.account_id === acc.id);
     acc.upnl = accTrades.reduce((sum, t) => {
       const tickVal = getContracts()[t.symbol]?.tickValue ?? 1;
-      return sum + (t.side === "buy"
-        ? (price - t.entry_price) * t.quantity * tickVal
-        : (t.entry_price - price) * t.quantity * tickVal);
+      return (
+        sum +
+        (t.side === "buy"
+          ? (price - t.entry_price) * t.quantity * tickVal
+          : (t.entry_price - price) * t.quantity * tickVal)
+      );
     }, 0);
     try {
       wsBroadcast({ type: "account_upnl", account_id: acc.id, upnl: acc.upnl });
@@ -189,14 +202,18 @@ async function processTick(symbol, price) {
   for (const order of toFill) await fillOrder(order, price, prev);
 
   // SL/TP auto-close
-  const toClose = openTrades.filter((t) => {
+  const toClose = getOpenTrades().filter((t) => {
     if (t.symbol !== norm) return false;
     if (Date.now() - new Date(t.time_opened).getTime() < SLTP_GRACE_MS) return false;
     if (t.side === "buy")
-      return (t.stop_loss != null && price <= t.stop_loss) ||
-             (t.take_profit != null && price >= t.take_profit);
-    return (t.stop_loss != null && price >= t.stop_loss) ||
-           (t.take_profit != null && price <= t.take_profit);
+      return (
+        (t.stop_loss != null && price <= t.stop_loss) ||
+        (t.take_profit != null && price >= t.take_profit)
+      );
+    return (
+      (t.stop_loss != null && price >= t.stop_loss) ||
+      (t.take_profit != null && price <= t.take_profit)
+    );
   });
   for (const t of toClose) await closeTrade(t, price, "SLTP Trigger");
 
@@ -327,7 +344,8 @@ async function fillOrder(order, basePrice, prevPrice) {
       };
 
       pendingOrders = pendingOrders.filter((o) => o.id !== order.id);
-      openTrades.push(trade);
+      addOpenTrade(trade);
+
       try {
         wsBroadcast({ type: "trade_fill", trade });
         await redis.publish("trade_events", JSON.stringify({ type: "TRADE_OPENED", trade }));
@@ -380,7 +398,8 @@ async function closeTrade(trade, closePrice, reason = null) {
     time_closed: new Date().toISOString(),
   };
 
-  openTrades = openTrades.filter((t) => t.id !== trade.id);
+  removeOpenTrade(trade.id);
+
   try {
     wsBroadcast({ type: "trade_close", trade: closed });
     await redis.publish("trade_events", JSON.stringify({ type: "TRADE_CLOSED", trade: closed, reason }));
@@ -401,7 +420,8 @@ async function closeTrade(trade, closePrice, reason = null) {
     console.error("❌ Supabase update trade/order:", err.message);
   }
 
-  const acc = accounts.get(trade.account_id);
+  // update account stats
+  const acc = getAccounts().find((a) => a.id === trade.account_id);
   if (acc) {
     acc.current_balance += netPnL;
     let sess = sessionPnL.get(acc.id);
@@ -411,7 +431,8 @@ async function closeTrade(trade, closePrice, reason = null) {
     if (sess.realized > sess.bestDay) sess.bestDay = sess.realized;
     sessionPnL.set(acc.id, sess);
 
-    accounts.set(acc.id, acc);
+    updateAccount(acc.id, acc);
+
     try {
       wsBroadcast({ type: "account_update", account: acc });
     } catch {}
@@ -428,7 +449,7 @@ async function closeTrade(trade, closePrice, reason = null) {
 
   const stillActive =
     pendingOrders.some((o) => o.symbol === trade.symbol) ||
-    openTrades.some((t) => t.symbol === trade.symbol);
+    getOpenTrades().some((t) => t.symbol === trade.symbol);
   if (!stillActive) markSymbolInactive(trade.symbol);
 
   await auditLog("TRADE_CLOSED", { trade: closed, reason });
@@ -470,21 +491,6 @@ async function convertPrice(symbol, price) {
 }
 
 // ===================================
-// GETTERS
-// ===================================
-function getOpenTrades() {
-  return openTrades;
-}
-
-function getPendingOrders() {
-  return pendingOrders;
-}
-
-function getAccounts() {
-  return Array.from(accounts.values());
-}
-
-// ===================================
 // EXPORTS
 // ===================================
 module.exports = {
@@ -495,13 +501,5 @@ module.exports = {
   fillOrder,
   closeTrade,
   getOpenTrades,
-  getPendingOrders,
   getAccounts,
 };
-
-// ✅ Register with getters.js
-registerGetters({
-  _getOpenTrades: getOpenTrades,
-  _getAccounts: getAccounts,
-  _closeTrade: closeTrade,
-});
