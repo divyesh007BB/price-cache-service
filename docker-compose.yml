@@ -35,6 +35,7 @@ services:
     environment:
       - NODE_ENV=production
       - REDIS_URL=redis://keydb:6379
+      - VERBOSE_LOGS=false   # ✅ throttle logs in VPS
     depends_on:
       keydb:
         condition: service_healthy

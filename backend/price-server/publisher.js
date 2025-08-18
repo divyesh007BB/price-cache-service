@@ -1,4 +1,4 @@
-// publisher.js — Binance Feed → Redis Pub/Sub (Production Ready)
+// publisher.js — Binance Feed → Redis Pub/Sub (Production Ready, Verbose Toggle)
 
 require("dotenv").config();
 const WebSocket = require("ws");
@@ -10,6 +10,9 @@ const dayjs = require("dayjs");
 const redisUrl = process.env.REDIS_URL;
 const BINANCE_PAIRS = ["BTCUSDT", "ETHUSDT", "XAUUSDT"];
 const PUB_CHANNEL = "price_ticks";
+
+// ✅ Verbose logging toggle (default false in prod)
+const VERBOSE_LOGS = process.env.VERBOSE_LOGS === "true";
 
 // ===== Redis (Publisher) =====
 const redis = new Redis(redisUrl, {
@@ -30,11 +33,21 @@ function aliasSymbol(pair) {
   return pair;
 }
 
-// ===== Publish to Redis =====
+// ===== Publish to Redis (with throttled logging if not verbose) =====
+const lastLogTs = {};
 function publishTick(symbol, price, ts) {
   const msg = { symbol, price, ts };
   redis.publish(PUB_CHANNEL, JSON.stringify(msg));
-  logEvent("PUB", `Published ${symbol} ${price}`);
+
+  if (VERBOSE_LOGS) {
+    logEvent("PUB", `Published ${symbol} ${price}`);
+  } else {
+    const now = Date.now();
+    if (!lastLogTs[symbol] || now - lastLogTs[symbol] > 1000) {
+      logEvent("PUB", `Published ${symbol} ${price}`);
+      lastLogTs[symbol] = now;
+    }
+  }
 }
 
 // ===== Bootstrap Price =====
