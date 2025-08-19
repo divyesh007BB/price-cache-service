@@ -10,9 +10,10 @@ const { createClient } = require("@supabase/supabase-js");
 const { preTradeRiskCheck } = require("./riskEngine");
 const Redis = require("ioredis");
 
+// ✅ Handle both local (SUPABASE_SERVICE_KEY) and VPS (SUPABASE_SERVICE_ROLE_KEY)
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
+  process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
 const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379", {

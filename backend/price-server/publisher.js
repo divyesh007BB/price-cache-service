@@ -1,4 +1,4 @@
-// publisher.js — Binance Feed → Redis Pub/Sub (Production Ready, Verbose Toggle)
+// publisher.js — Binance Feed → Redis Pub/Sub + Tick History + Orderbook Snapshots
 
 require("dotenv").config();
 const WebSocket = require("ws");
@@ -10,8 +10,9 @@ const dayjs = require("dayjs");
 const redisUrl = process.env.REDIS_URL;
 const BINANCE_PAIRS = ["BTCUSDT", "ETHUSDT", "XAUUSDT"];
 const PUB_CHANNEL = "price_ticks";
+const TICK_HISTORY_LIMIT = 1000; // keep last 1000 ticks per symbol
 
-// ✅ Verbose logging toggle (default false in prod)
+// ✅ Verbose logging toggle
 const VERBOSE_LOGS = process.env.VERBOSE_LOGS === "true";
 
 // ===== Redis (Publisher) =====
@@ -33,12 +34,23 @@ function aliasSymbol(pair) {
   return pair;
 }
 
-// ===== Publish to Redis (with throttled logging if not verbose) =====
+// ===== Publish Tick =====
 const lastLogTs = {};
-function publishTick(symbol, price, ts) {
+async function publishTick(symbol, price, ts) {
   const msg = { symbol, price, ts };
-  redis.publish(PUB_CHANNEL, JSON.stringify(msg));
 
+  // 1. Publish live tick
+  await redis.publish(PUB_CHANNEL, JSON.stringify(msg));
+
+  // 2. Push to rolling tick history
+  const key = `ticks:${symbol}`;
+  await redis.lpush(key, JSON.stringify(msg));
+  await redis.ltrim(key, 0, TICK_HISTORY_LIMIT - 1);
+
+  // 3. Update latest price
+  await redis.hset("latest_prices", symbol, JSON.stringify(msg));
+
+  // Logging
   if (VERBOSE_LOGS) {
     logEvent("PUB", `Published ${symbol} ${price}`);
   } else {
@@ -50,6 +62,13 @@ function publishTick(symbol, price, ts) {
   }
 }
 
+// ===== Publish Orderbook Snapshot =====
+async function publishOrderbook(symbol, bids, asks, ts) {
+  const snapshot = { bids, asks, ts };
+  await redis.set(`orderbook:${symbol}`, JSON.stringify(snapshot));
+  if (VERBOSE_LOGS) logEvent("OB", `Updated orderbook ${symbol}`);
+}
+
 // ===== Bootstrap Price =====
 async function bootstrapPrice(pair) {
   try {
@@ -58,7 +77,7 @@ async function bootstrapPrice(pair) {
     if (data?.price) {
       const price = parseFloat(data.price);
       const ts = Date.now();
-      publishTick(aliasSymbol(pair), price, ts);
+      await publishTick(aliasSymbol(pair), price, ts);
       logEvent("BOOT", `Fetched bootstrap ${pair} = ${price}`);
     } else {
       logEvent("WARN", `Bootstrap fetch returned no price for ${pair}`);
@@ -68,40 +87,77 @@ async function bootstrapPrice(pair) {
   }
 }
 
-// ===== Binance Feed =====
-function startBinanceFeed(pair, attempt = 1) {
+// ===== Binance Trade Feed =====
+function startTradeFeed(pair, attempt = 1) {
   const wsUrl = `wss://stream.binance.com:9443/ws/${pair.toLowerCase()}@trade`;
   const ws = new WebSocket(wsUrl);
 
   ws.on("open", () => {
-    logEvent("INFO", `Connected to Binance ${pair}`);
+    logEvent("INFO", `Connected to Binance Trade ${pair}`);
     attempt = 1;
   });
 
-  ws.on("message", (msg) => {
+  ws.on("message", async (msg) => {
     try {
       const data = JSON.parse(msg);
       if (data?.p) {
-        publishTick(aliasSymbol(pair), parseFloat(data.p), Date.now());
+        await publishTick(aliasSymbol(pair), parseFloat(data.p), Date.now());
       }
     } catch (err) {
-      logEvent("ERR", `${pair} parse error`, err.message);
+      logEvent("ERR", `${pair} trade parse error`, err.message);
     }
   });
 
   ws.on("close", () => {
-    logEvent("WARN", `${pair} feed closed — reconnecting...`);
-    setTimeout(() => startBinanceFeed(pair, attempt + 1), Math.min(30000, 2000 * attempt));
+    logEvent("WARN", `${pair} trade feed closed — reconnecting...`);
+    setTimeout(() => startTradeFeed(pair, attempt + 1), Math.min(30000, 2000 * attempt));
   });
 
-  ws.on("error", (err) => logEvent("ERR", `${pair} feed error`, err.message));
+  ws.on("error", (err) => logEvent("ERR", `${pair} trade feed error`, err.message));
+}
+
+// ===== Binance Depth Feed =====
+function startDepthFeed(pair, attempt = 1) {
+  const wsUrl = `wss://stream.binance.com:9443/ws/${pair.toLowerCase()}@depth5@100ms`;
+  const ws = new WebSocket(wsUrl);
+
+  ws.on("open", () => {
+    logEvent("INFO", `Connected to Binance Depth ${pair}`);
+    attempt = 1;
+  });
+
+  ws.on("message", async (msg) => {
+    try {
+      const data = JSON.parse(msg);
+      if (data?.bids && data?.asks) {
+        const symbol = aliasSymbol(pair);
+        const ts = Date.now();
+
+        // Only keep top 5 levels
+        const bids = data.bids.map(([price, qty]) => [parseFloat(price), parseFloat(qty)]);
+        const asks = data.asks.map(([price, qty]) => [parseFloat(price), parseFloat(qty)]);
+
+        await publishOrderbook(symbol, bids, asks, ts);
+      }
+    } catch (err) {
+      logEvent("ERR", `${pair} depth parse error`, err.message);
+    }
+  });
+
+  ws.on("close", () => {
+    logEvent("WARN", `${pair} depth feed closed — reconnecting...`);
+    setTimeout(() => startDepthFeed(pair, attempt + 1), Math.min(30000, 2000 * attempt));
+  });
+
+  ws.on("error", (err) => logEvent("ERR", `${pair} depth feed error`, err.message));
 }
 
 // ===== Start All Feeds =====
 async function startFeeds() {
   for (const pair of BINANCE_PAIRS) {
     await bootstrapPrice(pair);
-    startBinanceFeed(pair);
+    startTradeFeed(pair);
+    startDepthFeed(pair);
   }
   logEvent("START", `Publisher started for ${BINANCE_PAIRS.join(", ")}`);
 }

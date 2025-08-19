@@ -1,4 +1,4 @@
-// index.js — Production Price Server (Binance → Redis → Broadcast)
+// index.js — Production Price Server (Binance → Redis → Broadcast + Orderbook Snapshot)
 
 require("dotenv").config();
 const express = require("express");
@@ -15,7 +15,7 @@ dayjs.extend(timezone);
 
 // ===== Shared Imports =====
 const { normalizeSymbol } = require("../shared/symbolMap");
-const { WHITELIST, addTick, getTicks } = require("../shared/state");
+const { WHITELIST, addTick } = require("../shared/state");
 const {
   processTick,
   setBroadcaster,
@@ -160,15 +160,20 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
     logEvent("ERR", "Initial data load failed", err.message);
   }
 
-  // ✅ Start Binance feeds (unlimited, free)
-  startBinanceFeed("btcusdt", "BTCUSD");
-  startBinanceFeed("ethusdt", "ETHUSD");
+  // ✅ Start Binance feeds (trade + orderbook)
+  startBinanceTrade("btcusdt", "BTCUSD");
+  startBinanceTrade("ethusdt", "ETHUSD");
+  startBinanceTrade("xauusdt", "XAUUSD");
+
+  startBinanceOrderbook("btcusdt", "BTCUSD");
+  startBinanceOrderbook("ethusdt", "ETHUSD");
+  startBinanceOrderbook("xauusdt", "XAUUSD");
 });
 
-// ===== Binance Feed =====
-function startBinanceFeed(binanceSymbol, internalSymbol) {
+// ===== Binance Trade Feed =====
+function startBinanceTrade(binanceSymbol, internalSymbol) {
   const ws = new WebSocket(`wss://stream.binance.com:9443/ws/${binanceSymbol}@trade`);
-  ws.on("open", () => logEvent("FEED", `Connected Binance ${internalSymbol}`));
+  ws.on("open", () => logEvent("FEED", `Connected Trade ${internalSymbol}`));
   ws.on("message", async (msg) => {
     try {
       const data = JSON.parse(msg);
@@ -183,10 +188,32 @@ function startBinanceFeed(binanceSymbol, internalSymbol) {
 
       await redis.publish("price_ticks", JSON.stringify(tick));
     } catch (e) {
-      logEvent("ERR", "Binance parse failed", e.message);
+      logEvent("ERR", "Binance trade parse failed", e.message);
     }
   });
-  ws.on("close", () => logEvent("FEED", `Binance ${internalSymbol} closed`));
+  ws.on("close", () => logEvent("FEED", `Trade ${internalSymbol} closed`));
+}
+
+// ===== Binance Orderbook Feed =====
+function startBinanceOrderbook(binanceSymbol, internalSymbol) {
+  const ws = new WebSocket(`wss://stream.binance.com:9443/ws/${binanceSymbol}@depth10@100ms`);
+  ws.on("open", () => logEvent("FEED", `Connected OB ${internalSymbol}`));
+  ws.on("message", async (msg) => {
+    try {
+      const data = JSON.parse(msg);
+      const ob = {
+        bids: data.bids.map(([price, qty]) => [parseFloat(price), parseFloat(qty)]),
+        asks: data.asks.map(([price, qty]) => [parseFloat(price), parseFloat(qty)]),
+        ts: Date.now(),
+      };
+
+      await redis.set(`orderbook:${internalSymbol}`, JSON.stringify(ob), "EX", 10);
+      throttledBroadcast({ type: "orderbook", symbol: internalSymbol, ...ob });
+    } catch (e) {
+      logEvent("ERR", "Binance orderbook parse failed", e.message);
+    }
+  });
+  ws.on("close", () => logEvent("FEED", `OB ${internalSymbol} closed`));
 }
 
 // ===== WS Auth + Upgrade =====
@@ -195,10 +222,8 @@ server.on("upgrade", (req, socket, head) => {
   const headerKey = req.headers["sec-websocket-protocol"];
   const token = headerKey || queryKey;
 
-  console.log("[auth check]", { headerKey, queryKey, FEED_API_KEY });
-
   if (token !== FEED_API_KEY) {
-    console.log("[auth] ❌ Invalid key, closing socket");
+    logEvent("AUTH", "❌ Invalid key, closing socket");
     socket.destroy();
     return;
   }
@@ -209,28 +234,58 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 // ===== Handle WS connections =====
-wss.on("connection", (ws, req) => {
+wss.on("connection", async (ws, req) => {
   ws.isAlive = true;
   ws.subscriptions = new Set();
   ws.on("pong", heartbeat);
 
-  ws.send(JSON.stringify({ type: "welcome", symbols: Array.from(WHITELIST) }));
+  // ✅ Get all latest prices
+  const prices = {};
+  for (const sym of WHITELIST) {
+    const raw = await redis.hget("latest_prices", sym);
+    prices[sym] = raw ? JSON.parse(raw) : null;
+  }
+
+  // ✅ Get mini orderbook snapshot
+  const orderbooks = {};
+  for (const sym of WHITELIST) {
+    const raw = await redis.get(`orderbook:${sym}`);
+    orderbooks[sym] = raw ? JSON.parse(raw) : { bids: [], asks: [] };
+  }
+
+  // ✅ Send welcome packet with both prices + orderbooks
+  ws.send(JSON.stringify({ type: "welcome", prices, orderbooks }));
+
   logEvent("WS", `Client connected ${req.socket.remoteAddress}`);
 
-  ws.on("message", (msg) => {
+  ws.on("message", async (msg) => {
     try {
       const data = JSON.parse(msg.toString());
+
       if (data.type === "subscribe" && data.symbol) {
         const sym = normalizeSymbol(data.symbol);
         ws.subscriptions.add(sym);
         ws.send(JSON.stringify({ type: "subscribed", symbol: sym }));
+
+        // ✅ Send latest cached price + orderbook for this symbol
+        const raw = await redis.hget("latest_prices", sym);
+        if (raw) {
+          ws.send(JSON.stringify({ type: "price", symbol: sym, ...JSON.parse(raw) }));
+        }
+        const ob = await redis.get(`orderbook:${sym}`);
+        if (ob) {
+          ws.send(JSON.stringify({ type: "orderbook", symbol: sym, ...JSON.parse(ob) }));
+        }
       }
+
       if (data.type === "unsubscribe" && data.symbol) {
         const sym = normalizeSymbol(data.symbol);
         ws.subscriptions.delete(sym);
         ws.send(JSON.stringify({ type: "unsubscribed", symbol: sym }));
       }
-    } catch {}
+    } catch (err) {
+      logEvent("ERR", "WS message error", err.message);
+    }
   });
 });
 
