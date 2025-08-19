@@ -1,4 +1,4 @@
-// index.js — Production Price Server (Subscriber, Auth, Redis, Risk Forward)
+// index.js — Production Price Server (Binance → Redis → Broadcast)
 
 require("dotenv").config();
 const express = require("express");
@@ -26,10 +26,9 @@ const placeOrderRoute = require("./placeOrder");
 // ===== CONFIG =====
 const PORT = process.env.PORT || 4000;
 const redisUrl = process.env.REDIS_URL;
-const FEED_API_KEY = process.env.FEED_API_KEY || "supersecret"; // 🔑 auth
+const FEED_API_KEY = process.env.FEED_API_KEY || "supersecret";
 
 console.log("🔑 REDIS_URL =", redisUrl);
-console.log("🔑 SUPABASE_URL =", process.env.SUPABASE_URL);
 
 // ✅ Redis clients
 const redis = new Redis(redisUrl, { maxRetriesPerRequest: null });
@@ -81,48 +80,7 @@ async function saveTickHistoryThrottled(symbol, price, ts) {
   }
 }
 
-async function getPrice(symbol) {
-  try {
-    const raw = await redis.hget("latest_prices", symbol);
-    return raw ? JSON.parse(raw) : null;
-  } catch (err) {
-    logEvent("ERR", `getPrice failed for ${symbol}`, err.message);
-    return null;
-  }
-}
-
-async function getRecentTicks(symbol, limit = 20) { // reduced for perf
-  const buf = getTicks(symbol);
-  if (buf.length > 0) return buf.slice(-limit);
-  try {
-    const entries = await redis.lrange(`ticks:${symbol}`, 0, limit - 1);
-    return entries.map((e) => JSON.parse(e)).reverse();
-  } catch (err) {
-    logEvent("ERR", `Failed to get recent ticks for ${symbol}`, err.message);
-    return [];
-  }
-}
-
-// ===== Redis Subscriber =====
-redisSub.subscribe("price_ticks", (err) => {
-  if (err) console.error("❌ Failed to subscribe:", err);
-  else logEvent("START", "Subscribed to Redis channel: price_ticks");
-});
-
-redisSub.on("message", (channel, message) => {
-  try {
-    const tick = JSON.parse(message);
-    bufferPrice(tick.symbol, tick.price, tick.ts);
-    addTick(tick.symbol, tick.price, tick.ts);
-    saveTickHistoryThrottled(tick.symbol, tick.price, tick.ts);
-    throttledBroadcast({ type: "price", ...tick });
-    processTick(tick.symbol, tick.price); // ✅ risk engine + fills
-  } catch (err) {
-    logEvent("ERR", "Redis tick parse failed", err.message);
-  }
-});
-
-// ===== WS Broadcast =====
+// ===== BROADCAST =====
 function throttledBroadcast(msg) {
   const now = Date.now();
   if (now - TPS_BUCKET.ts > 1000) {
@@ -145,8 +103,6 @@ function broadcast(msg) {
     ) {
       if (client.bufferedAmount < 1e6) {
         client.send(data);
-      } else {
-        logEvent("WARN", "WS client buffer overflow, dropping msg");
       }
     }
   }
@@ -157,7 +113,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Rate limit: 100 req / 15 min per IP
+// ✅ Rate limit API only, not WS
 app.use(
   rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -169,6 +125,7 @@ app.use(
 
 app.use("/place-order", placeOrderRoute);
 
+// REST endpoint
 app.get("/prices", async (req, res) => {
   try {
     const symbols =
@@ -176,15 +133,8 @@ app.get("/prices", async (req, res) => {
       Array.from(WHITELIST);
     const prices = {};
     for (const sym of symbols) {
-      let val = await getPrice(sym);
-      if (!val) {
-        const ticks = getTicks(sym);
-        if (ticks.length) {
-          const last = ticks[ticks.length - 1];
-          val = { price: last.price, ts: last.ts };
-        }
-      }
-      prices[sym] = val;
+      const raw = await redis.hget("latest_prices", sym);
+      prices[sym] = raw ? JSON.parse(raw) : null;
     }
     res.json({ success: true, prices });
   } catch (err) {
@@ -192,33 +142,57 @@ app.get("/prices", async (req, res) => {
   }
 });
 
+// ===== WS server =====
 const wss = new WebSocket.Server({ noServer: true });
 function heartbeat() { this.isAlive = true; }
 
 // ===== Startup =====
 const server = app.listen(PORT, "0.0.0.0", async () => {
-  logEvent("START", `Price Server running on port ${PORT} (subscriber mode)`);
+  logEvent("START", `Price Server running on port ${PORT}`);
 
-  // ✅ Hook broadcaster into matching engine
   setBroadcaster((msg) => throttledBroadcast(msg));
 
-  // ✅ Load initial DB/Redis state
   try {
     await loadInitialData();
     logEvent("INIT", "Loaded initial data from Supabase + Redis");
   } catch (err) {
     logEvent("ERR", "Initial data load failed", err.message);
   }
+
+  // ✅ Start Binance feeds (unlimited, free)
+  startBinanceFeed("btcusdt", "BTCUSD");
+  startBinanceFeed("ethusdt", "ETHUSD");
 });
+
+// ===== Binance Feed =====
+function startBinanceFeed(binanceSymbol, internalSymbol) {
+  const ws = new WebSocket(`wss://stream.binance.com:9443/ws/${binanceSymbol}@trade`);
+  ws.on("open", () => logEvent("FEED", `Connected Binance ${internalSymbol}`));
+  ws.on("message", async (msg) => {
+    try {
+      const data = JSON.parse(msg);
+      const price = parseFloat(data.p);
+      const tick = { symbol: internalSymbol, price, ts: Date.now() };
+
+      bufferPrice(internalSymbol, price, tick.ts);
+      addTick(internalSymbol, price, tick.ts);
+      saveTickHistoryThrottled(internalSymbol, price, tick.ts);
+      throttledBroadcast({ type: "price", ...tick });
+      processTick(internalSymbol, price);
+
+      // persist for others
+      await redis.publish("price_ticks", JSON.stringify(tick));
+    } catch (e) {
+      logEvent("ERR", "Binance parse failed", e.message);
+    }
+  });
+  ws.on("close", () => logEvent("FEED", `Binance ${internalSymbol} closed`));
+}
 
 // ===== WS Auth + Upgrade =====
 server.on("upgrade", (req, socket, head) => {
-  const protocolKey = req.headers["sec-websocket-protocol"];
-  const queryKey = url.parse(req.url, true).query.key;
-  const token = protocolKey || queryKey;
-
+  const token = req.headers["sec-websocket-protocol"] || url.parse(req.url, true).query.key;
   if (token !== FEED_API_KEY) {
-    logEvent("AUTH", `Rejected WS connection from ${req.socket.remoteAddress}`);
     socket.destroy();
     return;
   }
@@ -228,23 +202,19 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 // ===== Handle WS connections =====
-wss.on("connection", async (ws, req) => {
+wss.on("connection", (ws, req) => {
   ws.isAlive = true;
   ws.subscriptions = new Set();
   ws.on("pong", heartbeat);
-  logEvent("WS", `Client connected from ${req.socket.remoteAddress}`);
 
   ws.send(JSON.stringify({ type: "welcome", symbols: Array.from(WHITELIST) }));
+  logEvent("WS", `Client connected ${req.socket.remoteAddress}`);
 
   ws.on("message", (msg) => {
     try {
       const data = JSON.parse(msg.toString());
       if (data.type === "subscribe" && data.symbol) {
         const sym = normalizeSymbol(data.symbol);
-        if (!WHITELIST.has(sym)) {
-          ws.send(JSON.stringify({ type: "error", error: "Symbol not allowed" }));
-          return;
-        }
         ws.subscriptions.add(sym);
         ws.send(JSON.stringify({ type: "subscribed", symbol: sym }));
       }
@@ -253,27 +223,11 @@ wss.on("connection", async (ws, req) => {
         ws.subscriptions.delete(sym);
         ws.send(JSON.stringify({ type: "unsubscribed", symbol: sym }));
       }
-    } catch (err) {
-      logEvent("ERR", "Invalid WS message", err.message);
-    }
+    } catch {}
   });
-
-  ws.on("close", () => {
-    logEvent("WS", `Client disconnected from ${req.socket.remoteAddress}`);
-    ws.subscriptions.clear();
-  });
-
-  // send snapshot
-  for (const sym of WHITELIST) {
-    const cached = await getPrice(sym);
-    if (cached) ws.send(JSON.stringify({ type: "price", symbol: sym, ...cached }));
-    const history = await getRecentTicks(sym, 20); // reduced snapshot
-    if (history.length)
-      ws.send(JSON.stringify({ type: "history", symbol: sym, ticks: history }));
-  }
 });
 
-// ===== WS Keepalive =====
+// ===== Keepalive =====
 setInterval(() => {
   wss.clients.forEach((ws) => {
     if (!ws.isAlive) return ws.terminate();
@@ -282,17 +236,10 @@ setInterval(() => {
   });
 }, 25000);
 
-// ===== Graceful Shutdown =====
+// ===== Shutdown =====
 process.on("SIGINT", async () => {
   logEvent("STOP", "Shutting down Price Server...");
   await redis.quit();
   await redisSub.quit();
   server.close(() => process.exit(0));
 });
-
-process.on("unhandledRejection", (err) =>
-  logEvent("FATAL", "UnhandledRejection", err)
-);
-process.on("uncaughtException", (err) =>
-  logEvent("FATAL", "UncaughtException", err)
-);
