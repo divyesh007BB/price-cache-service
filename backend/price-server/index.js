@@ -29,6 +29,7 @@ const redisUrl = process.env.REDIS_URL;
 const FEED_API_KEY = process.env.FEED_API_KEY || "supersecret";
 
 console.log("🔑 REDIS_URL =", redisUrl);
+console.log("🔑 FEED_API_KEY =", FEED_API_KEY);
 
 // ✅ Redis clients
 const redis = new Redis(redisUrl, { maxRetriesPerRequest: null });
@@ -180,7 +181,6 @@ function startBinanceFeed(binanceSymbol, internalSymbol) {
       throttledBroadcast({ type: "price", ...tick });
       processTick(internalSymbol, price);
 
-      // persist for others
       await redis.publish("price_ticks", JSON.stringify(tick));
     } catch (e) {
       logEvent("ERR", "Binance parse failed", e.message);
@@ -191,11 +191,18 @@ function startBinanceFeed(binanceSymbol, internalSymbol) {
 
 // ===== WS Auth + Upgrade =====
 server.on("upgrade", (req, socket, head) => {
-  const token = req.headers["sec-websocket-protocol"] || url.parse(req.url, true).query.key;
+  const queryKey = url.parse(req.url, true).query.key;
+  const headerKey = req.headers["sec-websocket-protocol"];
+  const token = headerKey || queryKey;
+
+  console.log("[auth check]", { headerKey, queryKey, FEED_API_KEY });
+
   if (token !== FEED_API_KEY) {
+    console.log("[auth] ❌ Invalid key, closing socket");
     socket.destroy();
     return;
   }
+
   if (url.parse(req.url).pathname === "/ws") {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
   } else socket.destroy();

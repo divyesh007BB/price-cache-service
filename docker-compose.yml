@@ -4,7 +4,7 @@ services:
   # ===========================
   # KeyDB (Redis-compatible)
   # ===========================
-  keydb:
+  aroha-keydb:
     image: eqalpha/keydb:latest
     container_name: aroha-keydb
     restart: unless-stopped
@@ -24,7 +24,7 @@ services:
   # ===========================
   # Publisher (Binance → Redis)
   # ===========================
-  publisher:
+  aroha-publisher:
     build:
       context: .
       dockerfile: Dockerfile
@@ -34,21 +34,21 @@ services:
       - ./.env
     environment:
       - NODE_ENV=production
-      - REDIS_URL=redis://keydb:6379
-      - VERBOSE_LOGS=false   # ✅ throttle logs in VPS
+      - REDIS_URL=redis://aroha-keydb:6379
+      - VERBOSE_LOGS=false
     depends_on:
-      keydb:
+      aroha-keydb:
         condition: service_healthy
     command: ["pm2-runtime", "backend/price-server/publisher.js"]
     networks:
       - aroha-net
     healthcheck:
-      disable: true   # 🚫 disabled to avoid false unhealthy
+      disable: true
 
   # ===========================
   # Price Server (WS + REST API)
   # ===========================
-  price-server:
+  aroha-price-server:
     build:
       context: .
       dockerfile: Dockerfile
@@ -59,11 +59,11 @@ services:
     environment:
       - PORT=4000
       - NODE_ENV=production
-      - REDIS_URL=redis://keydb:6379
+      - REDIS_URL=redis://aroha-keydb:6379
     depends_on:
-      keydb:
+      aroha-keydb:
         condition: service_healthy
-      publisher:
+      aroha-publisher:
         condition: service_started
     ports:
       - "4000:4000"
@@ -71,12 +71,12 @@ services:
     networks:
       - aroha-net
     healthcheck:
-      disable: true   # 🚫 disabled to avoid blocking startup
+      disable: true
 
   # ===========================
   # Matching Engine
   # ===========================
-  matching-engine:
+  aroha-matching-engine:
     build:
       context: .
       dockerfile: Dockerfile
@@ -86,19 +86,19 @@ services:
       - ./.env
     environment:
       - NODE_ENV=production
-      - REDIS_URL=redis://keydb:6379
+      - REDIS_URL=redis://aroha-keydb:6379
     depends_on:
-      keydb:
+      aroha-keydb:
         condition: service_healthy
-      publisher:
+      aroha-publisher:
         condition: service_started
-      price-server:
+      aroha-price-server:
         condition: service_started
     command: ["pm2-runtime", "backend/matching-engine/matchingEngine.js"]
     networks:
       - aroha-net
     healthcheck:
-      disable: true   # keep disabled for now
+      disable: true
 
 volumes:
   keydb_data:
