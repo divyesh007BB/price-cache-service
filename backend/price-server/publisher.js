@@ -1,4 +1,4 @@
-// publisher.js — Binance Feed → Redis Pub/Sub + Tick History + Orderbook Snapshots
+// publisher.js — Binance Feed → Redis Pub/Sub + Tick History + Orderbook Snapshots (Batched)
 
 require("dotenv").config();
 const WebSocket = require("ws");
@@ -11,6 +11,7 @@ const redisUrl = process.env.REDIS_URL;
 const BINANCE_PAIRS = ["BTCUSDT", "ETHUSDT", "XAUUSDT"];
 const PUB_CHANNEL = "price_ticks";
 const TICK_HISTORY_LIMIT = 1000; // keep last 1000 ticks per symbol
+const ORDERBOOK_BATCH_MS = 500;  // batch orderbook updates every 500ms
 
 // ✅ Verbose logging toggle
 const VERBOSE_LOGS = process.env.VERBOSE_LOGS === "true";
@@ -67,6 +68,24 @@ async function publishOrderbook(symbol, bids, asks, ts) {
   const snapshot = { bids, asks, ts };
   await redis.set(`orderbook:${symbol}`, JSON.stringify(snapshot));
   if (VERBOSE_LOGS) logEvent("OB", `Updated orderbook ${symbol}`);
+}
+
+// ===== Orderbook Buffer =====
+const obBuffer = {};   // symbol -> last orderbook
+const obTimers = {};   // symbol -> batching timer
+
+function queueOrderbook(symbol, bids, asks) {
+  obBuffer[symbol] = { bids, asks, ts: Date.now() };
+
+  if (!obTimers[symbol]) {
+    obTimers[symbol] = setTimeout(async () => {
+      const data = obBuffer[symbol];
+      if (data) {
+        await publishOrderbook(symbol, data.bids, data.asks, data.ts);
+      }
+      obTimers[symbol] = null;
+    }, ORDERBOOK_BATCH_MS);
+  }
 }
 
 // ===== Bootstrap Price =====
@@ -126,18 +145,18 @@ function startDepthFeed(pair, attempt = 1) {
     attempt = 1;
   });
 
-  ws.on("message", async (msg) => {
+  ws.on("message", (msg) => {
     try {
       const data = JSON.parse(msg);
       if (data?.bids && data?.asks) {
         const symbol = aliasSymbol(pair);
-        const ts = Date.now();
 
         // Only keep top 5 levels
         const bids = data.bids.map(([price, qty]) => [parseFloat(price), parseFloat(qty)]);
         const asks = data.asks.map(([price, qty]) => [parseFloat(price), parseFloat(qty)]);
 
-        await publishOrderbook(symbol, bids, asks, ts);
+        // Queue for batch publish
+        queueOrderbook(symbol, bids, asks);
       }
     } catch (err) {
       logEvent("ERR", `${pair} depth parse error`, err.message);
