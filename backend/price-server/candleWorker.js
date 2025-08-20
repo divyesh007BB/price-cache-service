@@ -1,7 +1,6 @@
 // candleWorker.js — Aggregates ticks into OHLC candles in Redis
 require("dotenv").config();
 const Redis = require("ioredis");
-const dayjs = require("dayjs");
 
 const redisUrl = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 const redis = new Redis(redisUrl, { maxRetriesPerRequest: null });
@@ -15,7 +14,6 @@ const INTERVALS = {
 };
 const MAX_CANDLES = 1000;
 
-// Keep in-memory candles before flush
 const liveBuckets = {}; // { key: {time, open, high, low, close} }
 
 function getBucketTime(tsSec, interval) {
@@ -25,9 +23,21 @@ function getBucketTime(tsSec, interval) {
 
 async function saveCandle(symbol, interval, candle) {
   const key = `candles:${symbol}:${interval}`;
+
+  // ✅ Dedup check: only save if candle changed
+  const last = await redis.lindex(key, -1);
+  if (last) {
+    try {
+      const prev = JSON.parse(last);
+      if (prev.time === candle.time && prev.close === candle.close) {
+        return; // skip duplicate
+      }
+    } catch {}
+  }
+
   try {
-    await redis.lpush(key, JSON.stringify(candle));
-    await redis.ltrim(key, 0, MAX_CANDLES - 1);
+    await redis.rpush(key, JSON.stringify(candle)); // append at end
+    await redis.ltrim(key, -MAX_CANDLES, -1); // keep last N
   } catch (err) {
     console.error("❌ Redis save error", key, err.message);
   }
@@ -36,7 +46,7 @@ async function saveCandle(symbol, interval, candle) {
 function processTick(tick) {
   const tsSec = Math.floor(tick.ts / 1000);
 
-  for (const [interval, bucketSecs] of Object.entries(INTERVALS)) {
+  for (const [interval] of Object.entries(INTERVALS)) {
     const bucketTime = getBucketTime(tsSec, interval);
     const key = `${tick.symbol}:${interval}`;
     let bucket = liveBuckets[key];
@@ -62,7 +72,25 @@ function processTick(tick) {
   }
 }
 
-// Flush any open candles periodically
+// ✅ Restore last open candle on restart
+async function preloadLastCandles() {
+  for (const interval of Object.keys(INTERVALS)) {
+    const keys = await redis.keys(`candles:*:${interval}`);
+    for (const key of keys) {
+      const symbol = key.split(":")[1];
+      const last = await redis.lindex(key, -1);
+      if (last) {
+        try {
+          const candle = JSON.parse(last);
+          liveBuckets[`${symbol}:${interval}`] = candle;
+          console.log(`🔄 Preloaded last ${interval} candle for ${symbol}`);
+        } catch {}
+      }
+    }
+  }
+}
+
+// Flush all current buckets periodically
 async function flushBuckets() {
   for (const [key, bucket] of Object.entries(liveBuckets)) {
     if (!bucket) continue;
@@ -70,7 +98,7 @@ async function flushBuckets() {
     await saveCandle(symbol, interval, bucket);
   }
 }
-setInterval(flushBuckets, 10_000); // every 10s
+setInterval(flushBuckets, 10_000);
 
 // ===== Subscribe to ticks =====
 redisSub.subscribe("price_ticks", (err) => {
@@ -89,3 +117,18 @@ redisSub.on("message", (channel, msg) => {
     console.error("❌ Tick parse error", e.message, msg);
   }
 });
+
+// ✅ Graceful shutdown
+function gracefulShutdown() {
+  console.log("⚠️ Shutting down, flushing candles...");
+  flushBuckets().then(() => {
+    redis.quit();
+    redisSub.quit();
+    process.exit(0);
+  });
+}
+process.on("SIGINT", gracefulShutdown);
+process.on("SIGTERM", gracefulShutdown);
+
+// Start preload
+preloadLastCandles();

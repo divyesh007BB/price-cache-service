@@ -100,6 +100,14 @@ async function loadInitialData() {
     `✅ Loaded ${getAccounts().length} accounts, ${pendingOrders.length} pending orders, ${getOpenTrades().length} open trades`
   );
   broadcastSnapshot();
+
+  // ✅ FIX: return state summary so caller won't see undefined
+  return {
+    accounts: getAccounts(),
+    pendingOrders,
+    openTrades: getOpenTrades(),
+    prices: latestPrices,
+  };
 }
 
 function setBroadcaster(fn) {
