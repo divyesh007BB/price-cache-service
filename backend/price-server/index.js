@@ -126,7 +126,9 @@ app.use(
 
 app.use("/place-order", placeOrderRoute);
 
-// REST endpoint
+// ===== REST Endpoints =====
+
+// latest price snapshot
 app.get("/prices", async (req, res) => {
   try {
     const symbols =
@@ -139,6 +141,57 @@ app.get("/prices", async (req, res) => {
     }
     res.json({ success: true, prices });
   } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// OHLC candle history
+app.get("/candles", async (req, res) => {
+  try {
+    const symbol = normalizeSymbol(req.query.symbol);
+    const interval = req.query.interval || "1m";
+    const limit = parseInt(req.query.limit || "200");
+
+    if (!symbol) {
+      return res.status(400).json({ success: false, error: "symbol required" });
+    }
+
+    const rawTicks = await redis.lrange(`ticks:${symbol}`, 0, limit * 100);
+    const ticks = rawTicks.map((x) => JSON.parse(x)).reverse();
+
+    const bucketSecs =
+      interval === "1m" ? 60 :
+      interval === "5m" ? 300 :
+      interval === "15m" ? 900 :
+      interval === "1h" ? 3600 : 60;
+
+    const candles = [];
+    let bucket = null;
+
+    for (const t of ticks) {
+      const ts = Math.floor(t.ts / 1000);
+      const bucketTime = Math.floor(ts / bucketSecs) * bucketSecs;
+
+      if (!bucket || bucket.time !== bucketTime) {
+        if (bucket) candles.push(bucket);
+        bucket = {
+          time: bucketTime,
+          open: t.price,
+          high: t.price,
+          low: t.price,
+          close: t.price,
+        };
+      } else {
+        bucket.high = Math.max(bucket.high, t.price);
+        bucket.low = Math.min(bucket.low, t.price);
+        bucket.close = t.price;
+      }
+    }
+    if (bucket) candles.push(bucket);
+
+    res.json(candles.reverse().slice(-limit));
+  } catch (err) {
+    logEvent("ERR", "Candle endpoint error", err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
