@@ -1,7 +1,7 @@
 // symbolMap.js — Phase 1: NIFTY + Binance BTC, Gold, EUR, GBP
 const { supabaseClient } = require("./supabaseClient"); // ✅ service role client
 
-// ✅ Local contract meta (defaults)
+// ===== Local contract meta (defaults) =====
 const CONTRACTS = {
   NIFTY: {
     qtyStep: 1,
@@ -11,7 +11,7 @@ const CONTRACTS = {
     tickValue: 50,
     convertToINR: true,
     maxLots: { Evaluation: 20, Funded: 50 },
-    tradingHours: { start: 3.5, end: 10.5 }, // IST hours
+    tradingHours: { start: 3.5, end: 10.5 }, // IST hours (UTC+5:30)
     dailyLossLimit: 100000,
     commission: 50,
     spread: 0.5,
@@ -70,7 +70,7 @@ const CONTRACTS = {
   },
 };
 
-// ✅ Feed + alias map
+// ===== Feed + alias map =====
 const FEED_SYMBOL_MAP = {
   "NSE:NIFTY": "NIFTY",
   NSENIFTY: "NIFTY",
@@ -95,9 +95,7 @@ const FEED_SYMBOL_MAP = {
   GBPUSD: "BINANCE:GBPUSDT",
 };
 
-/**
- * Normalize any incoming symbol to internal CONTRACTS key
- */
+// ===== Utils =====
 function normalizeSymbol(symbol) {
   if (!symbol) return "";
   const upper = symbol.toUpperCase();
@@ -107,36 +105,30 @@ function normalizeSymbol(symbol) {
   return upper;
 }
 
-/**
- * Get all contracts loaded in memory
- */
 function getContracts() {
   return CONTRACTS;
 }
 
-/**
- * Check if a given symbol is tradable at the current time
- */
 function isWithinTradingHours(symbol, now = new Date()) {
   const key = normalizeSymbol(symbol);
   const contract = CONTRACTS[key];
-  if (!contract?.tradingHours) return true; // default to tradable if no hours set
+  if (!contract?.tradingHours) return true;
 
   const utcHours = now.getUTCHours() + now.getUTCMinutes() / 60;
-  return (
-    utcHours >= contract.tradingHours.start &&
-    utcHours <= contract.tradingHours.end
-  );
+  const { start, end } = contract.tradingHours;
+
+  if (start <= end) {
+    return utcHours >= start && utcHours < end;
+  } else {
+    // Handles overnight sessions (e.g., 22 → 5)
+    return utcHours >= start || utcHours < end;
+  }
 }
 
-/**
- * Load all active instruments from Supabase into CONTRACTS
- */
 async function loadContractsFromDB() {
   const { data, error } = await supabaseClient
     .from("instruments")
     .select("*")
-    .in("code", Object.keys(CONTRACTS))
     .eq("is_active", true);
 
   if (error) {
@@ -145,16 +137,19 @@ async function loadContractsFromDB() {
   }
 
   if (!data || data.length === 0) {
-    console.warn("⚠ No active instruments found in DB, using defaults");
+    console.warn("⚠ No active instruments found in DB, using defaults only");
     return;
   }
 
   data.forEach((inst) => {
-    const key = inst.code?.toUpperCase();
+    // ✅ Normalize DB codes before storing
+    const key = normalizeSymbol(inst.code);
     if (!key) return;
+
     if (CONTRACTS[key]) {
       console.warn(`⚠ Overwriting default contract for ${key} with DB values`);
     }
+
     CONTRACTS[key] = {
       ...CONTRACTS[key],
       qtyStep: inst.qty_step ?? CONTRACTS[key]?.qtyStep,
@@ -162,25 +157,23 @@ async function loadContractsFromDB() {
       priceKey: inst.price_key ?? CONTRACTS[key]?.priceKey,
       display: inst.display_name ?? CONTRACTS[key]?.display,
       tickValue: inst.tick_value ?? CONTRACTS[key]?.tickValue,
-      convertToINR:
-        inst.convert_to_inr ?? CONTRACTS[key]?.convertToINR ?? false,
+      convertToINR: inst.convert_to_inr ?? CONTRACTS[key]?.convertToINR ?? false,
       maxLots: inst.max_lots || CONTRACTS[key]?.maxLots || {},
-      tradingHours:
-        inst.trading_hours || CONTRACTS[key]?.tradingHours || null,
-      dailyLossLimit:
-        inst.daily_loss_limit ?? CONTRACTS[key]?.dailyLossLimit,
+      tradingHours: inst.trading_hours || CONTRACTS[key]?.tradingHours || null,
+      dailyLossLimit: inst.daily_loss_limit ?? CONTRACTS[key]?.dailyLossLimit,
       commission: inst.commission ?? CONTRACTS[key]?.commission,
       spread: inst.spread ?? CONTRACTS[key]?.spread,
     };
   });
 
-  console.log(`✅ Loaded ${data.length} contracts from DB (Phase 1)`);
+  console.log(`✅ Loaded ${data.length} contracts from DB`);
 }
 
+// ===== Exports =====
 module.exports = {
   normalizeSymbol,
   getContracts,
   loadContractsFromDB,
   isWithinTradingHours,
-  CONTRACTS, // ✅ exported for direct access
+  CONTRACTS,
 };

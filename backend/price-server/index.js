@@ -14,7 +14,7 @@ dayjs.extend(utc);
 dayjs.extend(timezone);
 
 // ===== Shared Imports =====
-const { normalizeSymbol } = require("../shared/symbolMap");
+const { normalizeSymbol, getContracts } = require("../shared/symbolMap");
 const { WHITELIST, addTick } = require("../shared/state");
 const {
   processTick,
@@ -126,14 +126,27 @@ app.use(
 
 app.use("/place-order", placeOrderRoute);
 
-// ===== REST Endpoints =====
+// ===== API Key Middleware =====
+function requireApiKey(req, res, next) {
+  const queryKey = req.query.key;
+  const headerKey = req.headers["x-api-key"];
+  const token = headerKey || queryKey;
+  if (token !== FEED_API_KEY) {
+    return res.status(403).json({ success: false, error: "Forbidden" });
+  }
+  next();
+}
 
-// latest price snapshot
-app.get("/prices", async (req, res) => {
+// ===== REST Endpoints (secured + logged) =====
+app.get("/prices", requireApiKey, async (req, res) => {
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
   try {
     const symbols =
       req.query.symbols?.split(",").map((s) => normalizeSymbol(s)) ||
       Array.from(WHITELIST);
+
+    logEvent("API", `[/prices] from ${ip}, symbols=${symbols.join(",")}`);
+
     const prices = {};
     for (const sym of symbols) {
       const raw = await redis.hget("latest_prices", sym);
@@ -141,16 +154,19 @@ app.get("/prices", async (req, res) => {
     }
     res.json({ success: true, prices });
   } catch (err) {
+    logEvent("ERR", "Prices endpoint error", err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// OHLC candle history
-app.get("/candles", async (req, res) => {
+app.get("/candles", requireApiKey, async (req, res) => {
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
   try {
     const symbol = normalizeSymbol(req.query.symbol);
     const interval = req.query.interval || "1m";
     const limit = parseInt(req.query.limit || "200");
+
+    logEvent("API", `[/candles] from ${ip}, symbol=${symbol}, interval=${interval}, limit=${limit}`);
 
     if (!symbol) {
       return res.status(400).json({ success: false, error: "symbol required" });
@@ -196,6 +212,12 @@ app.get("/candles", async (req, res) => {
   }
 });
 
+app.get("/contracts", requireApiKey, (req, res) => {
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+  logEvent("API", `[/contracts] from ${ip}`);
+  res.json({ success: true, contracts: getContracts() });
+});
+
 // ===== WS server =====
 const wss = new WebSocket.Server({ noServer: true });
 function heartbeat() { this.isAlive = true; }
@@ -207,20 +229,23 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
   setBroadcaster((msg) => throttledBroadcast(msg));
 
   try {
-    await loadInitialData();
-    logEvent("INIT", "Loaded initial data from Supabase + Redis");
+    const instruments = await loadInitialData();
+    logEvent("INIT", `Loaded ${instruments.length} instruments from Supabase`);
+
+    instruments.forEach((inst) => {
+      if (!inst.feed_code) return;
+      const [exchange, pair] = inst.feed_code.split(":");
+      if (exchange === "BINANCE") {
+        const binanceSymbol = pair.toLowerCase();
+        const internalSymbol = inst.code;
+
+        startBinanceTrade(binanceSymbol, internalSymbol);
+        startBinanceOrderbook(binanceSymbol, internalSymbol);
+      }
+    });
   } catch (err) {
     logEvent("ERR", "Initial data load failed", err.message);
   }
-
-  // ✅ Start Binance feeds (trade + orderbook)
-  startBinanceTrade("btcusdt", "BTCUSD");
-  startBinanceTrade("ethusdt", "ETHUSD");
-  startBinanceTrade("xauusdt", "XAUUSD");
-
-  startBinanceOrderbook("btcusdt", "BTCUSD");
-  startBinanceOrderbook("ethusdt", "ETHUSD");
-  startBinanceOrderbook("xauusdt", "XAUUSD");
 });
 
 // ===== Binance Trade Feed =====
@@ -292,23 +317,19 @@ wss.on("connection", async (ws, req) => {
   ws.subscriptions = new Set();
   ws.on("pong", heartbeat);
 
-  // ✅ Get all latest prices
   const prices = {};
   for (const sym of WHITELIST) {
     const raw = await redis.hget("latest_prices", sym);
     prices[sym] = raw ? JSON.parse(raw) : null;
   }
 
-  // ✅ Get mini orderbook snapshot
   const orderbooks = {};
   for (const sym of WHITELIST) {
     const raw = await redis.get(`orderbook:${sym}`);
     orderbooks[sym] = raw ? JSON.parse(raw) : { bids: [], asks: [] };
   }
 
-  // ✅ Send welcome packet with both prices + orderbooks
   ws.send(JSON.stringify({ type: "welcome", prices, orderbooks }));
-
   logEvent("WS", `Client connected ${req.socket.remoteAddress}`);
 
   ws.on("message", async (msg) => {
@@ -320,7 +341,6 @@ wss.on("connection", async (ws, req) => {
         ws.subscriptions.add(sym);
         ws.send(JSON.stringify({ type: "subscribed", symbol: sym }));
 
-        // ✅ Send latest cached price + orderbook for this symbol
         const raw = await redis.hget("latest_prices", sym);
         if (raw) {
           ws.send(JSON.stringify({ type: "price", symbol: sym, ...JSON.parse(raw) }));

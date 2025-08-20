@@ -10,7 +10,7 @@ const { createClient } = require("@supabase/supabase-js");
 const { preTradeRiskCheck } = require("./riskEngine");
 const Redis = require("ioredis");
 
-// ✅ Handle both local (SUPABASE_SERVICE_KEY) and VPS (SUPABASE_SERVICE_ROLE_KEY)
+// ✅ Supabase client
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -70,11 +70,15 @@ router.post("/", async (req, res) => {
     if (order_type.toLowerCase() === "limit" && !limit_price)
       return res.status(400).json({ error: "Limit orders require limit_price" });
 
+    // ✅ Normalize once
     const normSymbol = normalizeSymbol(symbol);
 
     // --- Whitelist ---
-    if (!getWhitelist().has(normSymbol))
+    const whitelist = getWhitelist();
+    if (!whitelist.has(normSymbol)) {
+      console.error("❌ SYMBOL_NOT_SUPPORTED:", symbol, "→", normSymbol, whitelist);
       return res.status(400).json({ error: "SYMBOL_NOT_SUPPORTED" });
+    }
 
     const contract = getContracts()[normSymbol];
     if (!contract)
@@ -141,11 +145,11 @@ router.post("/", async (req, res) => {
       created_at: new Date().toISOString(),
     };
 
-    // 🚀 Forward to MatchingEngine (this will handle persistence + execution)
+    // 🚀 Forward to MatchingEngine
     await placeOrder(order);
 
     console.log(
-      `✅ Order forwarded to matchingEngine: ${order.id} (${order.type.toUpperCase()} ${order.quantity} ${order.symbol})`
+      `✅ Order forwarded: ${order.id} (${order.type.toUpperCase()} ${order.quantity} ${order.symbol})`
     );
 
     return res.json({
