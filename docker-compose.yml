@@ -41,7 +41,7 @@ services:
         condition: service_healthy
     ports:
       - "4000:4000"
-    command: ["pm2-runtime", "backend/price-server/index.js"]
+    command: ["pm2-runtime", "/app/backend/price-server/index.js"]
     networks:
       - aroha-net
 
@@ -62,7 +62,7 @@ services:
     depends_on:
       aroha-price-server:
         condition: service_started
-    command: ["pm2-runtime", "backend/matching-engine/matchingEngine.js"]
+    command: ["pm2-runtime", "/app/backend/matching-engine/matchingEngine.js"]
     networks:
       - aroha-net
 
@@ -83,7 +83,7 @@ services:
     depends_on:
       aroha-matching-engine:
         condition: service_started
-    command: ["pm2-runtime", "backend/matching-engine/riskEngine.js"] # <-- confirm path
+    command: ["pm2-runtime", "/app/backend/price-server/riskEngine.js"]
     networks:
       - aroha-net
 
@@ -104,9 +104,38 @@ services:
     depends_on:
       aroha-price-server:
         condition: service_started
-    command: ["pm2-runtime", "backend/price-server/candleWorker.js"]
+    command: ["pm2-runtime", "/app/backend/price-server/candleWorker.js"]
     networks:
       - aroha-net
+
+  # ===========================
+  # Relay Server (Frontend WS)
+  # ===========================
+  aroha-relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aroha-relay
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      - NODE_ENV=production
+      - RELAY_PORT=8080
+      - REDIS_URL=redis://aroha-keydb:6379
+    depends_on:
+      aroha-keydb:
+        condition: service_healthy
+    command: ["pm2-runtime", "/app/relay.js"]   # 👈 fixed absolute path
+    ports:
+      - "8080:8080"
+    networks:
+      - aroha-net
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:8080"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
 
   # ===========================
   # Redis Exporter (KeyDB Metrics)
@@ -205,6 +234,7 @@ services:
       - ./nginx/certs:/etc/nginx/certs:ro
     depends_on:
       - aroha-price-server
+      - aroha-relay
       - aroha-grafana
       - aroha-prometheus
     networks:

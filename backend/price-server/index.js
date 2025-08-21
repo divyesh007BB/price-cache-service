@@ -11,17 +11,17 @@ const dayjs = require("dayjs");
 const utc = require("dayjs/plugin/utc");
 const timezone = require("dayjs/plugin/timezone");
 const client = require("prom-client"); // ✅ Prometheus
+const { createClient } = require("@supabase/supabase-js");
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
 
 // ===== Shared Imports =====
-const { normalizeSymbol } = require("../shared/symbolMap");
+const { normalizeSymbol, CONTRACTS } = require("../shared/symbolMap");
 const { WHITELIST, addTick } = require("../shared/state");
 const {
   processTick,
   setBroadcaster,
-  loadInitialData,
 } = require("../matching-engine/matchingEngine");
 const placeOrderRoute = require("./placeOrder");
 
@@ -36,6 +36,12 @@ console.log("🔑 FEED_API_KEY =", FEED_API_KEY);
 // ✅ Redis clients
 const redis = new Redis(redisUrl, { maxRetriesPerRequest: null });
 const redisSub = new Redis(redisUrl, { maxRetriesPerRequest: null });
+
+// ✅ Supabase client
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 // ===== Prometheus Metrics =====
 client.collectDefaultMetrics();
@@ -78,8 +84,8 @@ const lastHistoryPush = {};
 const FLUSH_INTERVAL_MS = 200;
 const HISTORY_INTERVAL_MS = 1000;
 
-function bufferPrice(binanceSymbol, price, ts) {
-  priceBuffer[binanceSymbol] = JSON.stringify({ price, ts });
+function bufferPrice(symbol, price, ts) {
+  priceBuffer[symbol] = JSON.stringify({ price, ts });
 }
 
 async function flushPrices() {
@@ -94,18 +100,15 @@ async function flushPrices() {
 }
 setInterval(flushPrices, FLUSH_INTERVAL_MS);
 
-async function saveTickHistoryThrottled(binanceSymbol, price, ts) {
-  if (
-    !lastHistoryPush[binanceSymbol] ||
-    ts - lastHistoryPush[binanceSymbol] >= HISTORY_INTERVAL_MS
-  ) {
+async function saveTickHistoryThrottled(symbol, price, ts) {
+  if (!lastHistoryPush[symbol] || ts - lastHistoryPush[symbol] >= HISTORY_INTERVAL_MS) {
     try {
-      const key = `ticks:${binanceSymbol}`;
+      const key = `ticks:${symbol}`;
       await redis.lpush(key, JSON.stringify({ ts, price }));
       await redis.ltrim(key, 0, TICK_HISTORY_LIMIT - 1);
-      lastHistoryPush[binanceSymbol] = ts;
+      lastHistoryPush[symbol] = ts;
     } catch (err) {
-      logEvent("ERR", `Failed to save tick for ${binanceSymbol}`, err.message);
+      logEvent("ERR", `Failed to save tick for ${symbol}`, err.message);
     }
   }
 }
@@ -171,7 +174,7 @@ app.get("/prices", requireApiKey, async (req, res) => {
   const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
   try {
     const symbols =
-      req.query.symbols?.split(",").map((s) => s.toUpperCase()) ||
+      req.query.symbols?.split(",").map((s) => normalizeSymbol(s)) ||
       Array.from(WHITELIST);
 
     logEvent("API", `[/prices] from ${ip}, symbols=${symbols.join(",")}`);
@@ -193,7 +196,7 @@ app.get("/prices", requireApiKey, async (req, res) => {
 app.get("/candles", requireApiKey, async (req, res) => {
   const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
   try {
-    const symbol = req.query.symbol?.toUpperCase();
+    const symbol = normalizeSymbol(req.query.symbol);
     const interval = req.query.interval || "1m";
     const limit = parseInt(req.query.limit || "200");
 
@@ -202,8 +205,8 @@ app.get("/candles", requireApiKey, async (req, res) => {
       `[/candles] from ${ip}, symbol=${symbol}, interval=${interval}, limit=${limit}`
     );
 
-    if (!symbol) {
-      res.status(400).json({ success: false, error: "symbol required" });
+    if (!symbol || !CONTRACTS[symbol]) {
+      res.status(400).json({ success: false, error: "invalid symbol" });
       observeRequest(req, res, "/candles");
       return;
     }
@@ -271,6 +274,20 @@ function heartbeat() {
   this.isAlive = true;
 }
 
+// ===== Supabase Instruments Loader =====
+async function loadInstruments() {
+  const { data, error } = await supabase
+    .from("instruments")
+    .select("code, feed_code, display_name, is_active")
+    .eq("is_active", true);
+
+  if (error) {
+    logEvent("ERR", "Failed to load instruments from Supabase", error.message);
+    return [];
+  }
+  return data || [];
+}
+
 // ===== Startup =====
 const server = app.listen(PORT, "0.0.0.0", async () => {
   logEvent("START", `Price Server running on port ${PORT}`);
@@ -278,47 +295,51 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
   setBroadcaster((msg) => throttledBroadcast(msg));
 
   try {
-    const instruments = await loadInitialData();
-    logEvent("INIT", `Loaded ${instruments.length} instruments from Supabase`);
+    const instruments = await loadInstruments();
+    logEvent("INIT", `Loaded ${instruments.length} active instruments from Supabase`);
 
-    instruments.forEach((inst) => {
-      if (!inst.feed_code) return;
+    for (const inst of instruments) {
+      if (!inst.feed_code) continue;
       const [exchange, pair] = inst.feed_code.split(":");
-      if (exchange === "BINANCE") {
-        const binanceSymbol = pair.toUpperCase();
-        const norm = normalizeSymbol(binanceSymbol);
 
-        startBinanceTrade(binanceSymbol, norm);
-        startBinanceOrderbook(binanceSymbol, norm);
+      switch (exchange) {
+        case "BINANCE":
+          const binanceSymbol = pair.toUpperCase();
+          startBinanceTrade(binanceSymbol);
+          startBinanceOrderbook(binanceSymbol);
+          break;
       }
-    });
+    }
   } catch (err) {
     logEvent("ERR", "Initial data load failed", err.message);
   }
 });
 
 // ===== Binance Trade Feed =====
-function startBinanceTrade(binanceSymbol, norm) {
+function startBinanceTrade(binanceSymbol) {
   const ws = new WebSocket(
     `wss://stream.binance.com:9443/ws/${binanceSymbol.toLowerCase()}@trade`
   );
-  ws.on("open", () =>
-    logEvent("FEED", `Connected Trade ${binanceSymbol}/${norm}`)
-  );
+  ws.on("open", () => logEvent("FEED", `Connected Trade ${binanceSymbol}`));
   ws.on("message", async (msg) => {
     try {
       const data = JSON.parse(msg);
       const price = parseFloat(data.p);
-      const tick = { symbol: binanceSymbol, norm, price, ts: Date.now() };
+      const ts = Date.now();
+      const norm = normalizeSymbol(`BINANCE:${binanceSymbol}`);
+      if (!CONTRACTS[norm]) return;
 
-      bufferPrice(binanceSymbol, price, tick.ts);
-      addTick(binanceSymbol, price, tick.ts);
-      saveTickHistoryThrottled(binanceSymbol, price, tick.ts);
+      const tick = { symbol: norm, raw: binanceSymbol, price, ts };
+
+      bufferPrice(norm, price, ts);
+      addTick(norm, price, ts);
+      saveTickHistoryThrottled(norm, price, ts);
       throttledBroadcast({ type: "price", ...tick });
-      processTick(binanceSymbol, price);
+      processTick(norm, price);
 
-      ticksPublished.inc({ symbol: binanceSymbol }); // ✅ metric
+      ticksPublished.inc({ symbol: norm });
       await redis.publish("price_ticks", JSON.stringify(tick));
+      logEvent("PUB", `${binanceSymbol} → ${norm}`, tick);
     } catch (e) {
       logEvent("ERR", "Binance trade parse failed", e.message);
     }
@@ -327,31 +348,31 @@ function startBinanceTrade(binanceSymbol, norm) {
 }
 
 // ===== Binance Orderbook Feed =====
-function startBinanceOrderbook(binanceSymbol, norm) {
+function startBinanceOrderbook(binanceSymbol) {
   const ws = new WebSocket(
     `wss://stream.binance.com:9443/ws/${binanceSymbol.toLowerCase()}@depth10@100ms`
   );
-  ws.on("open", () =>
-    logEvent("FEED", `Connected OB ${binanceSymbol}/${norm}`)
-  );
+  ws.on("open", () => logEvent("FEED", `Connected OB ${binanceSymbol}`));
   ws.on("message", async (msg) => {
     try {
       const data = JSON.parse(msg);
+      const ts = Date.now();
+      const norm = normalizeSymbol(`BINANCE:${binanceSymbol}`);
+      if (!CONTRACTS[norm]) return;
+
       const ob = {
-        bids: data.bids.map(([price, qty]) => [
-          parseFloat(price),
-          parseFloat(qty),
-        ]),
-        asks: data.asks.map(([price, qty]) => [
-          parseFloat(price),
-          parseFloat(qty),
-        ]),
-        ts: Date.now(),
-        norm,
+        bids: data.bids.map(([p, q]) => [parseFloat(p), parseFloat(q)]),
+        asks: data.asks.map(([p, q]) => [parseFloat(p), parseFloat(q)]),
+        ts,
+        symbol: norm,
+        raw: binanceSymbol,
       };
 
-      await redis.set(`orderbook:${binanceSymbol}`, JSON.stringify(ob), "EX", 10);
-      throttledBroadcast({ type: "orderbook", symbol: binanceSymbol, ...ob });
+      await redis.set(`orderbook:${norm}`, JSON.stringify(ob), "EX", 10);
+      await redis.publish(`orderbook_${norm}`, JSON.stringify(ob));
+
+      throttledBroadcast({ type: "orderbook", ...ob });
+      logEvent("PUB", `${binanceSymbol} → ${norm} orderbook`, { ts });
     } catch (e) {
       logEvent("ERR", "Binance orderbook parse failed", e.message);
     }
@@ -399,10 +420,10 @@ wss.on("connection", async (ws, req) => {
   ws.send(JSON.stringify({ type: "welcome", prices, orderbooks }));
   logEvent("WS", `Client connected ${req.socket.remoteAddress}`);
 
-  wsConnections.inc(); // ✅ metric
+  wsConnections.inc();
 
   ws.on("close", () => {
-    wsConnections.dec(); // ✅ metric
+    wsConnections.dec();
   });
 
   ws.on("message", async (msg) => {
@@ -410,28 +431,29 @@ wss.on("connection", async (ws, req) => {
       const data = JSON.parse(msg.toString());
 
       if (data.type === "subscribe" && data.symbol) {
-        const binanceSymbol = data.symbol.toUpperCase();
-        ws.subscriptions.add(binanceSymbol);
-        ws.send(JSON.stringify({ type: "subscribed", symbol: binanceSymbol }));
+        const norm = normalizeSymbol(data.symbol);
+        if (!CONTRACTS[norm]) return;
+        ws.subscriptions.add(norm);
+        ws.send(JSON.stringify({ type: "subscribed", symbol: norm }));
 
-        const raw = await redis.hget("latest_prices", binanceSymbol);
+        const raw = await redis.hget("latest_prices", norm);
         if (raw) {
           ws.send(
-            JSON.stringify({ type: "price", symbol: binanceSymbol, ...JSON.parse(raw) })
+            JSON.stringify({ type: "price", symbol: norm, ...JSON.parse(raw) })
           );
         }
-        const ob = await redis.get(`orderbook:${binanceSymbol}`);
+        const ob = await redis.get(`orderbook:${norm}`);
         if (ob) {
           ws.send(
-            JSON.stringify({ type: "orderbook", symbol: binanceSymbol, ...JSON.parse(ob) })
+            JSON.stringify({ type: "orderbook", symbol: norm, ...JSON.parse(ob) })
           );
         }
       }
 
       if (data.type === "unsubscribe" && data.symbol) {
-        const binanceSymbol = data.symbol.toUpperCase();
-        ws.subscriptions.delete(binanceSymbol);
-        ws.send(JSON.stringify({ type: "unsubscribed", symbol: binanceSymbol }));
+        const norm = normalizeSymbol(data.symbol);
+        ws.subscriptions.delete(norm);
+        ws.send(JSON.stringify({ type: "unsubscribed", symbol: norm }));
       }
     } catch (err) {
       logEvent("ERR", "WS message error", err.message);

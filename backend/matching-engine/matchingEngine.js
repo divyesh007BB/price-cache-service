@@ -83,12 +83,12 @@ async function loadInitialData() {
   pendingOrders = poData || [];
 
   const { data: otData } = await supabase.from("trades").select("*").eq("is_open", true);
-  setOpenTrades(otData || []);
+  setOpenTrades((otData || []).map((t) => ({ ...t, symbol: normalizeSymbol(t.symbol) })));
 
   try {
     const all = await redis.hgetall("latest_prices");
     for (const [symbol, val] of Object.entries(all)) {
-      latestPrices[symbol] = JSON.parse(val);
+      latestPrices[normalizeSymbol(symbol)] = JSON.parse(val);
     }
     console.log(`✅ Loaded ${Object.keys(latestPrices).length} prices from Redis/KeyDB`);
   } catch (err) {
@@ -101,7 +101,6 @@ async function loadInitialData() {
   );
   broadcastSnapshot();
 
-  // ✅ FIX: return state summary so caller won't see undefined
   return {
     accounts: getAccounts(),
     pendingOrders,
@@ -135,8 +134,9 @@ async function subscribePriceFeed() {
     if (ch === "price_ticks") {
       try {
         const { symbol, price, ts } = JSON.parse(msg);
-        latestPrices[symbol] = { price, ts };
-        await processTick(symbol, price);
+        const norm = normalizeSymbol(symbol);
+        latestPrices[norm] = { price, ts };
+        await processTick(norm, price);
       } catch (err) {
         console.error("❌ Failed to process price tick:", err);
       }
@@ -149,11 +149,12 @@ async function subscribePriceFeed() {
 // PRICE FETCH (fallback)
 // ===================================
 async function fetchPriceNow(symbol) {
-  const meta = getContracts()[symbol];
+  const norm = normalizeSymbol(symbol);
+  const meta = getContracts()[norm];
   if (!meta) return null;
   let price = null;
   try {
-    const vendorSymbol = meta.priceKey || symbol;
+    const vendorSymbol = meta.priceKey || norm;
     if (vendorSymbol.startsWith("BINANCE:")) {
       const pair = vendorSymbol.replace("BINANCE:", "").toUpperCase();
       const r = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${pair}`);
@@ -161,8 +162,8 @@ async function fetchPriceNow(symbol) {
       if (d?.price) price = parseFloat(d.price);
     }
     if (price && price > 0) {
-      latestPrices[symbol] = { price, ts: Date.now() };
-      addTick(symbol, price, Date.now());
+      latestPrices[norm] = { price, ts: Date.now() };
+      addTick(norm, price, Date.now());
       return price;
     }
   } catch (err) {
@@ -185,9 +186,9 @@ async function processTick(symbol, price) {
 
   // Update unrealized PnL
   getAccounts().forEach((acc) => {
-    const accTrades = getOpenTrades().filter((t) => t.account_id === acc.id);
+    const accTrades = getOpenTrades().filter((t) => normalizeSymbol(t.symbol) === norm && t.account_id === acc.id);
     acc.upnl = accTrades.reduce((sum, t) => {
-      const tickVal = getContracts()[t.symbol]?.tickValue ?? 1;
+      const tickVal = getContracts()[norm]?.tickValue ?? 1;
       return (
         sum +
         (t.side === "buy"
@@ -203,7 +204,7 @@ async function processTick(symbol, price) {
   // Fill limit orders
   const toFill = pendingOrders.filter(
     (o) =>
-      o.symbol === norm &&
+      normalizeSymbol(o.symbol) === norm &&
       ((o.side === "buy" && price <= o.limit_price) ||
         (o.side === "sell" && price >= o.limit_price))
   );
@@ -211,7 +212,8 @@ async function processTick(symbol, price) {
 
   // SL/TP auto-close
   const toClose = getOpenTrades().filter((t) => {
-    if (t.symbol !== norm) return false;
+    const tNorm = normalizeSymbol(t.symbol);
+    if (tNorm !== norm) return false;
     if (Date.now() - new Date(t.time_opened).getTime() < SLTP_GRACE_MS) return false;
     if (t.side === "buy")
       return (
@@ -309,6 +311,7 @@ async function placeOrder(order) {
 // FILL ORDER
 // ===================================
 async function fillOrder(order, basePrice, prevPrice) {
+  order.symbol = normalizeSymbol(order.symbol); // ✅ normalize here
   const lock = accountLocks.get(order.account_id) || Promise.resolve();
   accountLocks.set(
     order.account_id,
@@ -390,6 +393,7 @@ async function fillOrder(order, basePrice, prevPrice) {
 // CLOSE TRADE
 // ===================================
 async function closeTrade(trade, closePrice, reason = null) {
+  trade.symbol = normalizeSymbol(trade.symbol); // ✅ normalize here
   const tickValue = getContracts()[trade.symbol]?.tickValue ?? 1;
   const pnl = trade.side === "buy"
     ? (closePrice - trade.entry_price) * trade.quantity * tickValue
@@ -456,8 +460,8 @@ async function closeTrade(trade, closePrice, reason = null) {
   }
 
   const stillActive =
-    pendingOrders.some((o) => o.symbol === trade.symbol) ||
-    getOpenTrades().some((t) => t.symbol === trade.symbol);
+    pendingOrders.some((o) => normalizeSymbol(o.symbol) === trade.symbol) ||
+    getOpenTrades().some((t) => normalizeSymbol(t.symbol) === trade.symbol);
   if (!stillActive) markSymbolInactive(trade.symbol);
 
   await auditLog("TRADE_CLOSED", { trade: closed, reason });
@@ -489,7 +493,8 @@ async function auditLog(event, payload) {
 }
 
 async function convertPrice(symbol, price) {
-  const meta = getContracts()[symbol];
+  const norm = normalizeSymbol(symbol);
+  const meta = getContracts()[norm];
   if (meta?.convertToINR) {
     const usdInrRaw = latestPrices["USDINR"] || safeParse(await redis.get("price:USDINR"));
     const usdInr = usdInrRaw?.price ?? 83;

@@ -5,7 +5,7 @@ const dns = require("dns").promises;
 const Redis = require("ioredis");
 
 const { supabaseClient: supabase } = require("../shared/supabaseClient");
-const { getContracts } = require("../shared/symbolMap");
+const { getContracts, normalizeSymbol } = require("../shared/symbolMap");
 const { getOpenTrades, getAccounts } = require("../matching-engine/tradeState");
 const { closeTrade } = require("../matching-engine/matchingEngine");
 
@@ -44,7 +44,8 @@ sub.on("pmessage", async (pattern, channel, message) => {
 
     if (channel.startsWith("price:")) {
       const { symbol, price } = event;
-      await evaluateOpenPositions(symbol, price);
+      const norm = normalizeSymbol(symbol);
+      await evaluateOpenPositions(norm, price);
     }
 
     if (channel === "trade_events") {
@@ -52,7 +53,7 @@ sub.on("pmessage", async (pattern, channel, message) => {
       await supabase.from("trade_audit").insert({
         account_id: event.account_id,
         trade_id: event.trade_id || null,
-        symbol: event.symbol,
+        symbol: normalizeSymbol(event.symbol),
         side: event.side,
         size: event.size,
         price: event.execPrice,
@@ -72,7 +73,7 @@ sub.on("pmessage", async (pattern, channel, message) => {
       await supabase.from("order_audit").insert({
         account_id: event.account_id,
         order_id: event.order_id || null,
-        symbol: event.symbol,
+        symbol: normalizeSymbol(event.symbol),
         side: event.side,
         size: event.size,
         order_type: event.order_type,
@@ -92,6 +93,8 @@ sub.on("pmessage", async (pattern, channel, message) => {
 // ✅ Pre-trade risk validation
 async function preTradeRiskCheck(accountId, symbol, size) {
   try {
+    const norm = normalizeSymbol(symbol);
+
     const account = await supabaseQueryWithRetry(() =>
       supabase.from("accounts").select("*").eq("id", accountId).single()
     );
@@ -101,7 +104,9 @@ async function preTradeRiskCheck(accountId, symbol, size) {
       return { ok: false, error: "ACCOUNT_INACTIVE" };
     }
 
-    const contract = getContracts()[symbol];
+    const contract = getContracts()[norm];
+    if (!contract) return { ok: false, error: "SYMBOL_NOT_SUPPORTED" };
+
     if (contract?.maxLots && size > contract.maxLots.Evaluation) {
       return { ok: false, error: "MAX_LOT_SIZE" };
     }
@@ -123,6 +128,8 @@ async function preTradeRiskCheck(accountId, symbol, size) {
 // ✅ Immediate risk evaluation after a fill
 async function evaluateImmediateRisk(accountId, symbol, size, execPrice) {
   try {
+    const norm = normalizeSymbol(symbol);
+
     const account = await supabaseQueryWithRetry(() =>
       supabase.from("accounts").select("*").eq("id", accountId).single()
     );
@@ -132,7 +139,9 @@ async function evaluateImmediateRisk(accountId, symbol, size, execPrice) {
       return { ok: false, error: "ACCOUNT_INACTIVE" };
     }
 
-    const contract = getContracts()[symbol];
+    const contract = getContracts()[norm];
+    if (!contract) return { ok: false, error: "SYMBOL_NOT_SUPPORTED" };
+
     if (contract?.maxLots && size > contract.maxLots.Evaluation) {
       return { ok: false, error: "MAX_LOT_SIZE" };
     }
@@ -161,16 +170,17 @@ async function evaluateImmediateRisk(accountId, symbol, size, execPrice) {
 // ✅ Runtime evaluation of open positions + risk checks
 async function evaluateOpenPositions(symbol, tickPrice) {
   try {
+    const norm = normalizeSymbol(symbol);
     const now = Date.now();
     const openPositions = getOpenTrades();
     const accounts = getAccounts();
-    const contract = getContracts()[symbol];
+    const contract = getContracts()[norm];
     if (!contract) return;
 
     // ---- SL/TP checks ----
     await Promise.all(
       openPositions.map(async (pos) => {
-        if (pos.symbol !== symbol) return;
+        if (normalizeSymbol(pos.symbol) !== norm) return;
         if (now - new Date(pos.time_opened).getTime() < SLTP_GRACE_MS) return;
 
         let shouldClose = false;
