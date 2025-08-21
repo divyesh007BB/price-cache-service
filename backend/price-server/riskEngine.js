@@ -1,5 +1,4 @@
-// backend/price-server/riskEngine.js — Prop firm grade risk engine (Topstep/FTMO style)
-// Rules: Trailing Drawdown, Static Max Loss, Daily Loss Limit, Consistency Rule, Slippage, Partial Fills
+// backend/price-server/riskEngine.js — Prop firm grade risk engine
 
 require("dotenv").config();
 const dns = require("dns").promises;
@@ -7,12 +6,11 @@ const Redis = require("ioredis");
 
 const { supabaseClient: supabase } = require("../shared/supabaseClient");
 const { getContracts } = require("../shared/symbolMap");
-
-// ✅ Use tradeState for getters (avoids circular dependency)
 const { getOpenTrades, getAccounts } = require("../matching-engine/tradeState");
-
-// ✅ Import only closeTrade from matchingEngine
 const { closeTrade } = require("../matching-engine/matchingEngine");
+
+// ✅ Import utils
+const { supabaseQueryWithRetry, applySlippage, applyPartialFill } = require("../shared/riskUtils");
 
 const SLTP_GRACE_MS = 1000;
 
@@ -31,7 +29,6 @@ const SLTP_GRACE_MS = 1000;
 const redisUrl = process.env.REDIS_URL;
 const sub = new Redis(redisUrl);
 
-// Use psubscribe for wildcards
 sub.psubscribe("price:*", "trade_events", "order_events", (err, count) => {
   if (err) {
     console.error("❌ Failed to subscribe to Redis:", err);
@@ -65,7 +62,6 @@ sub.on("pmessage", async (pattern, channel, message) => {
         created_at: new Date().toISOString()
       });
 
-      // ✅ Run immediate risk check on fills
       if (event.type === "TRADE_OPEN") {
         await evaluateImmediateRisk(event.account_id, event.symbol, event.size, event.execPrice);
       }
@@ -92,39 +88,6 @@ sub.on("pmessage", async (pattern, channel, message) => {
     console.error("❌ Redis message parse error:", err.message || err);
   }
 });
-
-// ---- Retry wrapper ----
-async function supabaseQueryWithRetry(queryFn, retries = 5, delayMs = 300) {
-  let lastErr;
-  for (let i = 0; i < retries; i++) {
-    try {
-      const { data, error } = await queryFn();
-      if (error) throw error;
-      return data;
-    } catch (err) {
-      lastErr = err;
-      console.warn(`⚠ Supabase query retry ${i + 1}/${retries} — ${err.message || err}`);
-      await new Promise((r) => setTimeout(r, delayMs * Math.pow(2, i)));
-    }
-  }
-  console.error("❌ Supabase query failed after retries:", lastErr.message || lastErr);
-  throw lastErr;
-}
-
-// ✅ Slippage model
-function applySlippage(entryPrice, tickPrice, side, liquidityGap = 0) {
-  let slippage = entryPrice * 0.0001;
-  if (liquidityGap > 0) slippage += liquidityGap * 0.25;
-  return side === "buy" ? tickPrice + slippage : tickPrice - slippage;
-}
-
-// ✅ Partial fill model
-function applyPartialFill(size, contract) {
-  if (!contract?.allowPartialFills) return { filled: size, remaining: 0 };
-  const ratio = contract.partialFillRatio || 0.5;
-  const filled = Math.max(1, Math.floor(size * ratio));
-  return { filled, remaining: size - filled };
-}
 
 // ✅ Pre-trade risk validation
 async function preTradeRiskCheck(accountId, symbol, size) {
@@ -319,13 +282,8 @@ async function handleBreach(account, tickPrice, reason) {
   }));
 }
 
-// ===================================
-// EXPORTS
-// ===================================
 module.exports = {
   evaluateOpenPositions,
   preTradeRiskCheck,
-  evaluateImmediateRisk,
-  applySlippage,
-  applyPartialFill
+  evaluateImmediateRisk
 };

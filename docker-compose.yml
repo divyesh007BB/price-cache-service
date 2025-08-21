@@ -22,28 +22,6 @@ services:
       retries: 5
 
   # ===========================
-  # Publisher (Binance → Redis)
-  # ===========================
-  aroha-publisher:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: aroha-publisher
-    restart: unless-stopped
-    env_file:
-      - ./.env
-    environment:
-      - NODE_ENV=production
-      - REDIS_URL=redis://aroha-keydb:6379
-      - VERBOSE_LOGS=false
-    depends_on:
-      aroha-keydb:
-        condition: service_healthy
-    command: ["pm2-runtime", "backend/price-server/publisher.js"]
-    networks:
-      - aroha-net
-
-  # ===========================
   # Price Server (WS + REST API)
   # ===========================
   aroha-price-server:
@@ -61,9 +39,7 @@ services:
     depends_on:
       aroha-keydb:
         condition: service_healthy
-      aroha-publisher:
-        condition: service_started
-    ports: # changed expose → ports so Nginx can reach from host too
+    ports:
       - "4000:4000"
     command: ["pm2-runtime", "backend/price-server/index.js"]
     networks:
@@ -107,7 +83,7 @@ services:
     depends_on:
       aroha-matching-engine:
         condition: service_started
-    command: ["pm2-runtime", "backend/price-server/riskEngine.js"]
+    command: ["pm2-runtime", "backend/matching-engine/riskEngine.js"] # <-- confirm path
     networks:
       - aroha-net
 
@@ -126,7 +102,7 @@ services:
       - NODE_ENV=production
       - REDIS_URL=redis://aroha-keydb:6379
     depends_on:
-      aroha-publisher:
+      aroha-price-server:
         condition: service_started
     command: ["pm2-runtime", "backend/price-server/candleWorker.js"]
     networks:
@@ -135,7 +111,7 @@ services:
   # ===========================
   # Redis Exporter (KeyDB Metrics)
   # ===========================
-  redis-exporter:
+  aroha-redis-exporter:
     image: oliver006/redis_exporter:latest
     container_name: aroha-redis-exporter
     restart: unless-stopped
@@ -151,7 +127,7 @@ services:
   # ===========================
   # Node Exporter (Host Metrics)
   # ===========================
-  node-exporter:
+  aroha-node-exporter:
     image: prom/node-exporter:latest
     container_name: aroha-node-exporter
     restart: unless-stopped
@@ -163,7 +139,7 @@ services:
   # ===========================
   # Prometheus (Metrics DB)
   # ===========================
-  prometheus:
+  aroha-prometheus:
     image: prom/prometheus:latest
     container_name: aroha-prometheus
     restart: unless-stopped
@@ -175,13 +151,13 @@ services:
     networks:
       - aroha-net
     depends_on:
-      - redis-exporter
-      - node-exporter
+      - aroha-redis-exporter
+      - aroha-node-exporter
 
   # ===========================
   # Alertmanager (Notifications)
   # ===========================
-  alertmanager:
+  aroha-alertmanager:
     image: prom/alertmanager:latest
     container_name: aroha-alertmanager
     restart: unless-stopped
@@ -192,12 +168,12 @@ services:
     networks:
       - aroha-net
     depends_on:
-      - prometheus
+      - aroha-prometheus
 
   # ===========================
   # Grafana (Dashboard UI)
   # ===========================
-  grafana:
+  aroha-grafana:
     image: grafana/grafana:latest
     container_name: aroha-grafana
     restart: unless-stopped
@@ -209,15 +185,15 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
     depends_on:
-      - prometheus
-      - alertmanager
+      - aroha-prometheus
+      - aroha-alertmanager
     networks:
       - aroha-net
 
   # ===========================
   # Nginx Reverse Proxy (SSL + API Gateway)
   # ===========================
-  nginx:
+  aroha-nginx:
     image: nginx:latest
     container_name: aroha-nginx
     restart: unless-stopped
@@ -229,8 +205,8 @@ services:
       - ./nginx/certs:/etc/nginx/certs:ro
     depends_on:
       - aroha-price-server
-      - grafana
-      - prometheus
+      - aroha-grafana
+      - aroha-prometheus
     networks:
       - aroha-net
 
