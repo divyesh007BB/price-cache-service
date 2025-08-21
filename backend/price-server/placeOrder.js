@@ -1,4 +1,5 @@
-// placeOrder.js — Gateway API for order validation + forwarding (prop firm style)
+// placeOrder.js — Gateway API for order validation + persistence + audit logging
+// Topstep/FTMO-grade with Supabase + Redis + Prometheus metrics
 
 const express = require("express");
 const router = express.Router();
@@ -9,6 +10,7 @@ const { v4: uuidv4 } = require("uuid");
 const { createClient } = require("@supabase/supabase-js");
 const { preTradeRiskCheck } = require("./riskEngine");
 const Redis = require("ioredis");
+const client = require("prom-client");
 
 // ✅ Supabase client
 const supabase = createClient(
@@ -16,13 +18,27 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+// ✅ Redis
 const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379", {
   maxRetriesPerRequest: null,
   enableReadyCheck: true,
   retryStrategy: (times) => Math.min(times * 200, 2000),
 });
 
-// ===== Helper =====
+// ===== Metrics =====
+const orderValidationTime = new client.Histogram({
+  name: "order_validation_ms",
+  help: "Order validation latency (ms)",
+  buckets: [5, 10, 20, 50, 100, 200, 500],
+});
+
+const orderExecutionTime = new client.Histogram({
+  name: "order_execution_ms",
+  help: "Time from accept → forward to matchingEngine",
+  buckets: [5, 10, 20, 50, 100, 200, 500],
+});
+
+// ===== Helpers =====
 function getWhitelist() {
   return WHITELIST && WHITELIST.size > 0
     ? WHITELIST
@@ -39,8 +55,19 @@ async function getPriceFromRedis(symbol) {
   }
 }
 
+async function auditLog(order) {
+  try {
+    await redis.lpush("audit:orders", JSON.stringify(order));
+    await redis.ltrim("audit:orders", 0, 10000); // keep last 10k
+  } catch (err) {
+    console.error("❌ Failed auditLog:", err.message);
+  }
+}
+
 // ===== Route =====
 router.post("/", async (req, res) => {
+  const validationTimer = orderValidationTime.startTimer();
+
   try {
     const {
       user_id,
@@ -103,8 +130,12 @@ router.post("/", async (req, res) => {
     if (!riskCheck.ok)
       return res.status(400).json({ error: riskCheck.error });
 
-    // --- Idempotency check ---
+    // --- Idempotency (Redis + Supabase) ---
     if (idempotency_key) {
+      const dup = await redis.get(`idem:${idempotency_key}`);
+      if (dup) {
+        return res.status(200).json({ status: "duplicate", order_id: dup });
+      }
       const { data: existingOrder } = await supabase
         .from("orders")
         .select("id, created_at")
@@ -113,7 +144,6 @@ router.post("/", async (req, res) => {
       if (existingOrder) {
         return res.status(200).json({
           status: "duplicate",
-          message: "Order already processed",
           order_id: existingOrder.id,
         });
       }
@@ -136,27 +166,47 @@ router.post("/", async (req, res) => {
       symbol: normSymbol,
       side: side.toLowerCase(),
       quantity: Number(quantity),
-      type: order_type.toLowerCase(), // match matchingEngine field
+      type: order_type.toLowerCase(),
       stop_loss: stop_loss ? Number(stop_loss) : null,
       take_profit: take_profit ? Number(take_profit) : null,
       limit_price: limit_price ? Number(limit_price) : null,
       entry_price: entryPrice,
       idempotency_key: idempotency_key || null,
       created_at: new Date().toISOString(),
+      status: "pending",
     };
 
+    validationTimer(); // stop validation timer
+    const execTimer = orderExecutionTime.startTimer();
+
+    // 🚀 Persist to Supabase
+    const { error: insertErr } = await supabase.from("orders").insert(order);
+    if (insertErr) {
+      console.error("❌ Supabase insert failed:", insertErr.message);
+    }
+
+    // 🚀 Audit log
+    await auditLog(order);
+
     // 🚀 Forward to MatchingEngine
-    await placeOrder(order);
+    const result = await placeOrder(order);
+    execTimer();
+
+    // --- Idempotency key persistence ---
+    if (idempotency_key) {
+      await redis.set(`idem:${idempotency_key}`, order.id, "EX", 60 * 5);
+    }
 
     console.log(
-      `✅ Order forwarded: ${order.id} (${order.type.toUpperCase()} ${order.quantity} ${order.symbol})`
+      `✅ Order processed: ${order.id} (${order.type.toUpperCase()} ${order.quantity} ${order.symbol})`
     );
 
     return res.json({
       status: "success",
+      kind: result?.kind || (order.type === "market" ? "filled_market" : "accepted_limit"),
       message:
         order.type === "market"
-          ? "Market order sent for execution"
+          ? "Market order filled"
           : `Limit order accepted at ${order.limit_price}`,
       order_id: order.id,
     });
