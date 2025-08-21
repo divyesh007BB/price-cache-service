@@ -9,10 +9,10 @@ COPY package*.json ./
 # Install deps + pm2
 RUN npm install --only=production && npm install -g pm2
 
-# Copy ALL backend source
+# Copy source
 COPY backend/price-server ./backend/price-server
 COPY backend/matching-engine ./backend/matching-engine
-COPY backend/shared ./backend/shared   # ✅ FIXED PATH
+COPY backend/shared ./backend/shared
 
 # Environment
 ENV NODE_ENV=production
