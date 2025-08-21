@@ -1,0 +1,20 @@
+global:
+  resolve_timeout: 5m
+  smtp_smarthost: 'smtp.gmail.com:587'
+  smtp_from: 'alerts@aroha.in'
+  smtp_auth_username: 'alerts@aroha.in'
+  smtp_auth_password: 'yourpassword'
+
+route:
+  receiver: 'default'
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 10m
+
+receivers:
+  - name: 'default'
+    email_configs:
+      - to: 'divyesh@aroha.in'
+    slack_configs:
+      - api_url: 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK'
+        channel: '#alerts'

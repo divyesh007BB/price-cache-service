@@ -1,0 +1,52 @@
+groups:
+  - name: aroha-alerts
+    rules:
+      # Risk Engine Down
+      - alert: RiskEngineDown
+        expr: up{job="risk-engine"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Risk Engine is down"
+          description: "Risk Engine has not responded for >1 minute."
+
+      # Matching Engine Down
+      - alert: MatchingEngineDown
+        expr: up{job="matching-engine"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Matching Engine is down"
+          description: "Matching Engine is unresponsive."
+
+      # Redis Lag High
+      - alert: RedisLagHigh
+        expr: redis_connected_clients > 1000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis lag high"
+          description: "Too many Redis connections (>1000), may cause delays."
+
+      # CPU High
+      - alert: HighCPUUsage
+        expr: 100 - (avg by(instance)(irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU Usage"
+          description: "CPU usage > 80% for 5 minutes."
+
+      # Memory High
+      - alert: HighMemoryUsage
+        expr: (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High Memory Usage"
+          description: "Memory usage > 80% for 5 minutes."

@@ -42,8 +42,6 @@ services:
     command: ["pm2-runtime", "backend/price-server/publisher.js"]
     networks:
       - aroha-net
-    healthcheck:
-      disable: true
 
   # ===========================
   # Price Server (WS + REST API)
@@ -65,13 +63,11 @@ services:
         condition: service_healthy
       aroha-publisher:
         condition: service_started
-    ports:
+    ports: # changed expose → ports so Nginx can reach from host too
       - "4000:4000"
     command: ["pm2-runtime", "backend/price-server/index.js"]
     networks:
       - aroha-net
-    healthcheck:
-      disable: true
 
   # ===========================
   # Matching Engine
@@ -88,20 +84,160 @@ services:
       - NODE_ENV=production
       - REDIS_URL=redis://aroha-keydb:6379
     depends_on:
-      aroha-keydb:
-        condition: service_healthy
-      aroha-publisher:
-        condition: service_started
       aroha-price-server:
         condition: service_started
     command: ["pm2-runtime", "backend/matching-engine/matchingEngine.js"]
     networks:
       - aroha-net
-    healthcheck:
-      disable: true
+
+  # ===========================
+  # Risk Engine
+  # ===========================
+  aroha-risk-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aroha-risk-engine
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      - NODE_ENV=production
+      - REDIS_URL=redis://aroha-keydb:6379
+    depends_on:
+      aroha-matching-engine:
+        condition: service_started
+    command: ["pm2-runtime", "backend/price-server/riskEngine.js"]
+    networks:
+      - aroha-net
+
+  # ===========================
+  # Candle Worker (OHLC)
+  # ===========================
+  aroha-candle-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aroha-candle-worker
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      - NODE_ENV=production
+      - REDIS_URL=redis://aroha-keydb:6379
+    depends_on:
+      aroha-publisher:
+        condition: service_started
+    command: ["pm2-runtime", "backend/price-server/candleWorker.js"]
+    networks:
+      - aroha-net
+
+  # ===========================
+  # Redis Exporter (KeyDB Metrics)
+  # ===========================
+  redis-exporter:
+    image: oliver006/redis_exporter:latest
+    container_name: aroha-redis-exporter
+    restart: unless-stopped
+    environment:
+      - REDIS_ADDR=redis://aroha-keydb:6379
+    ports:
+      - "9121:9121"
+    networks:
+      - aroha-net
+    depends_on:
+      - aroha-keydb
+
+  # ===========================
+  # Node Exporter (Host Metrics)
+  # ===========================
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: aroha-node-exporter
+    restart: unless-stopped
+    ports:
+      - "9100:9100"
+    networks:
+      - aroha-net
+
+  # ===========================
+  # Prometheus (Metrics DB)
+  # ===========================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: aroha-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - aroha-net
+    depends_on:
+      - redis-exporter
+      - node-exporter
+
+  # ===========================
+  # Alertmanager (Notifications)
+  # ===========================
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: aroha-alertmanager
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+    ports:
+      - "9093:9093"
+    networks:
+      - aroha-net
+    depends_on:
+      - prometheus
+
+  # ===========================
+  # Grafana (Dashboard UI)
+  # ===========================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: aroha-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - alertmanager
+    networks:
+      - aroha-net
+
+  # ===========================
+  # Nginx Reverse Proxy (SSL + API Gateway)
+  # ===========================
+  nginx:
+    image: nginx:latest
+    container_name: aroha-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - aroha-price-server
+      - grafana
+      - prometheus
+    networks:
+      - aroha-net
 
 volumes:
   keydb_data:
+  prometheus_data:
+  grafana_data:
 
 networks:
   aroha-net:

@@ -3,17 +3,24 @@ FROM node:20-alpine
 # Set working dir
 WORKDIR /app
 
-# Copy package.json + lock
-COPY package*.json ./
+# Copy backend package files only
+COPY backend/price-server/package*.json ./backend/price-server/
+COPY shared/package*.json ./shared/
 
-# Install deps + pm2
-RUN npm install --only=production && npm install -g pm2
+# Install deps
+RUN cd backend/price-server && npm install --production && cd ../..
+RUN npm install -g pm2
 
-# Copy ALL project files (backend + root scripts)
-COPY . .
+# Copy source
+COPY backend/price-server ./backend/price-server
+COPY shared ./shared
 
 # Environment
 ENV NODE_ENV=production
+ENV PORT=4000
 
-# Default CMD (overridden in docker-compose)
+# Expose port
+EXPOSE 4000
+
+# Start with pm2
 CMD ["pm2-runtime", "backend/price-server/index.js"]

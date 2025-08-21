@@ -6,12 +6,15 @@ const Redis = require("ioredis");
 const fetch = require("node-fetch");
 const dayjs = require("dayjs");
 
+// ===== Shared SymbolMap (for UI normalization) =====
+const { normalizeSymbol } = require("../shared/symbolMap");
+
 // ===== CONFIG =====
 const redisUrl = process.env.REDIS_URL;
 const BINANCE_PAIRS = ["BTCUSDT", "ETHUSDT", "XAUUSDT"];
 const PUB_CHANNEL = "price_ticks";
 const TICK_HISTORY_LIMIT = 1000; // keep last 1000 ticks per symbol
-const ORDERBOOK_BATCH_MS = 500;  // batch orderbook updates every 500ms
+const ORDERBOOK_BATCH_MS = 500; // batch orderbook updates every 500ms
 
 // ✅ Verbose logging toggle
 const VERBOSE_LOGS = process.env.VERBOSE_LOGS === "true";
@@ -27,63 +30,57 @@ function logEvent(type, msg, extra) {
   console.log(`[${dayjs().format("YYYY-MM-DD HH:mm:ss")}] [${type}] ${msg}`, extra || "");
 }
 
-// ===== Symbol Mapping =====
-function aliasSymbol(pair) {
-  if (pair === "BTCUSDT") return "BTCUSD";
-  if (pair === "ETHUSDT") return "ETHUSD";
-  if (pair === "XAUUSDT") return "XAUUSD";
-  return pair;
-}
-
 // ===== Publish Tick =====
 const lastLogTs = {};
-async function publishTick(symbol, price, ts) {
-  const msg = { symbol, price, ts };
+async function publishTick(pair, price, ts) {
+  const norm = normalizeSymbol(pair); // UI symbol
+  const msg = { symbol: pair, norm, price, ts };
 
-  // 1. Publish live tick
+  // 1. Publish live tick (frontend will read `norm`)
   await redis.publish(PUB_CHANNEL, JSON.stringify(msg));
 
-  // 2. Push to rolling tick history
-  const key = `ticks:${symbol}`;
+  // 2. Push to rolling tick history (Binance-style key)
+  const key = `ticks:${pair}`;
   await redis.lpush(key, JSON.stringify(msg));
   await redis.ltrim(key, 0, TICK_HISTORY_LIMIT - 1);
 
   // 3. Update latest price
-  await redis.hset("latest_prices", symbol, JSON.stringify(msg));
+  await redis.hset("latest_prices", pair, JSON.stringify(msg));
 
   // Logging
   if (VERBOSE_LOGS) {
-    logEvent("PUB", `Published ${symbol} ${price}`);
+    logEvent("PUB", `Published ${norm}/${pair} ${price}`);
   } else {
     const now = Date.now();
-    if (!lastLogTs[symbol] || now - lastLogTs[symbol] > 1000) {
-      logEvent("PUB", `Published ${symbol} ${price}`);
-      lastLogTs[symbol] = now;
+    if (!lastLogTs[pair] || now - lastLogTs[pair] > 1000) {
+      logEvent("PUB", `Published ${norm}/${pair} ${price}`);
+      lastLogTs[pair] = now;
     }
   }
 }
 
 // ===== Publish Orderbook Snapshot =====
-async function publishOrderbook(symbol, bids, asks, ts) {
-  const snapshot = { bids, asks, ts };
-  await redis.set(`orderbook:${symbol}`, JSON.stringify(snapshot));
-  if (VERBOSE_LOGS) logEvent("OB", `Updated orderbook ${symbol}`);
+async function publishOrderbook(pair, bids, asks, ts) {
+  const norm = normalizeSymbol(pair);
+  const snapshot = { bids, asks, ts, norm };
+  await redis.set(`orderbook:${pair}`, JSON.stringify(snapshot));
+  if (VERBOSE_LOGS) logEvent("OB", `Updated orderbook ${norm}/${pair}`);
 }
 
 // ===== Orderbook Buffer =====
-const obBuffer = {};   // symbol -> last orderbook
-const obTimers = {};   // symbol -> batching timer
+const obBuffer = {};
+const obTimers = {};
 
-function queueOrderbook(symbol, bids, asks) {
-  obBuffer[symbol] = { bids, asks, ts: Date.now() };
+function queueOrderbook(pair, bids, asks) {
+  obBuffer[pair] = { bids, asks, ts: Date.now() };
 
-  if (!obTimers[symbol]) {
-    obTimers[symbol] = setTimeout(async () => {
-      const data = obBuffer[symbol];
+  if (!obTimers[pair]) {
+    obTimers[pair] = setTimeout(async () => {
+      const data = obBuffer[pair];
       if (data) {
-        await publishOrderbook(symbol, data.bids, data.asks, data.ts);
+        await publishOrderbook(pair, data.bids, data.asks, data.ts);
       }
-      obTimers[symbol] = null;
+      obTimers[pair] = null;
     }, ORDERBOOK_BATCH_MS);
   }
 }
@@ -96,7 +93,7 @@ async function bootstrapPrice(pair) {
     if (data?.price) {
       const price = parseFloat(data.price);
       const ts = Date.now();
-      await publishTick(aliasSymbol(pair), price, ts);
+      await publishTick(pair, price, ts);
       logEvent("BOOT", `Fetched bootstrap ${pair} = ${price}`);
     } else {
       logEvent("WARN", `Bootstrap fetch returned no price for ${pair}`);
@@ -120,7 +117,7 @@ function startTradeFeed(pair, attempt = 1) {
     try {
       const data = JSON.parse(msg);
       if (data?.p) {
-        await publishTick(aliasSymbol(pair), parseFloat(data.p), Date.now());
+        await publishTick(pair, parseFloat(data.p), Date.now());
       }
     } catch (err) {
       logEvent("ERR", `${pair} trade parse error`, err.message);
@@ -149,14 +146,10 @@ function startDepthFeed(pair, attempt = 1) {
     try {
       const data = JSON.parse(msg);
       if (data?.bids && data?.asks) {
-        const symbol = aliasSymbol(pair);
-
         // Only keep top 5 levels
         const bids = data.bids.map(([price, qty]) => [parseFloat(price), parseFloat(qty)]);
         const asks = data.asks.map(([price, qty]) => [parseFloat(price), parseFloat(qty)]);
-
-        // Queue for batch publish
-        queueOrderbook(symbol, bids, asks);
+        queueOrderbook(pair, bids, asks);
       }
     } catch (err) {
       logEvent("ERR", `${pair} depth parse error`, err.message);

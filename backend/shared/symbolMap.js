@@ -72,24 +72,29 @@ const CONTRACTS = {
 
 // ===== Feed + alias map =====
 const FEED_SYMBOL_MAP = {
+  // NIFTY
   "NSE:NIFTY": "NIFTY",
   NSENIFTY: "NIFTY",
   NIFTY: "NIFTY",
 
+  // BTC
   "BINANCE:BTCUSDT": "BINANCE:BTCUSDT",
   BINANCEBTCUSDT: "BINANCE:BTCUSDT",
   BTCUSD: "BINANCE:BTCUSDT",
   BTC: "BINANCE:BTCUSDT",
 
+  // GOLD
   "BINANCE:XAUUSDT": "BINANCE:XAUUSDT",
   BINANCEXAUUSDT: "BINANCE:XAUUSDT",
   XAUUSD: "BINANCE:XAUUSDT",
   GOLD: "BINANCE:XAUUSDT",
 
+  // EUR
   "BINANCE:EURUSDT": "BINANCE:EURUSDT",
   BINANCEEURUSDT: "BINANCE:EURUSDT",
   EURUSD: "BINANCE:EURUSDT",
 
+  // GBP
   "BINANCE:GBPUSDT": "BINANCE:GBPUSDT",
   BINANCEGBPUSDT: "BINANCE:GBPUSDT",
   GBPUSD: "BINANCE:GBPUSDT",
@@ -99,9 +104,14 @@ const FEED_SYMBOL_MAP = {
 function normalizeSymbol(symbol) {
   if (!symbol) return "";
   const upper = symbol.toUpperCase();
+
+  // Direct match
   if (FEED_SYMBOL_MAP[upper]) return FEED_SYMBOL_MAP[upper];
+
+  // Strip colons/underscores (BTC_USDT → BTCUSDT)
   const stripped = upper.replace(/[:_]/g, "");
   if (FEED_SYMBOL_MAP[stripped]) return FEED_SYMBOL_MAP[stripped];
+
   return upper;
 }
 
@@ -142,7 +152,6 @@ async function loadContractsFromDB() {
   }
 
   data.forEach((inst) => {
-    // ✅ Normalize DB codes before storing
     const key = normalizeSymbol(inst.code);
     if (!key) return;
 
