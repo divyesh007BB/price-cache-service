@@ -1,5 +1,4 @@
-// index.js — Production Price Server (Topstep-level hardened)
-// Binance → Redis → Broadcast + Orderbook + Persistence + Metrics
+// index.js — Production Price Server (Topstep-level hardened, Redis-driven)
 
 require("dotenv").config();
 const express = require("express");
@@ -19,8 +18,8 @@ dayjs.extend(timezone);
 
 // ===== Shared Imports =====
 const { normalizeSymbol, CONTRACTS } = require("../shared/symbolMap");
-const { WHITELIST, addTick, setWhitelist } = require("../shared/state");
-const { processTick, setBroadcaster } = require("../matching-engine/matchingEngine");
+const { WHITELIST, setWhitelist } = require("../shared/state");
+const { setBroadcaster } = require("../matching-engine/matchingEngine");
 const placeOrderRoute = require("./placeOrder");
 
 // ===== CONFIG =====
@@ -66,79 +65,6 @@ function logEvent(type, msg, extra) {
   console.log(`[${dayjs().format("YYYY-MM-DD HH:mm:ss")}] [${type}] ${msg}`, extra || "");
 }
 
-// ===== Price Storage =====
-const TICK_HISTORY_LIMIT = 1000;
-const MAX_BROADCAST_TPS = 20;
-const TPS_BUCKET = { count: 0, ts: Date.now() };
-const priceBuffer = {};
-const lastHistoryPush = {};
-const FLUSH_INTERVAL_MS = 200;
-const HISTORY_INTERVAL_MS = 1000;
-
-function bufferPrice(symbol, price, ts) {
-  priceBuffer[symbol] = JSON.stringify({ price, ts });
-}
-
-async function flushPrices() {
-  if (Object.keys(priceBuffer).length > 0) {
-    try {
-      await redis.hset("latest_prices", priceBuffer);
-      for (const k of Object.keys(priceBuffer)) delete priceBuffer[k];
-    } catch (err) {
-      logEvent("ERR", "Failed to flush prices", err.message);
-    }
-  }
-}
-setInterval(flushPrices, FLUSH_INTERVAL_MS);
-
-async function saveTickHistoryThrottled(symbol, price, ts) {
-  if (!lastHistoryPush[symbol] || ts - lastHistoryPush[symbol] >= HISTORY_INTERVAL_MS) {
-    try {
-      const key = `ticks:${symbol}`;
-      await redis.lpush(key, JSON.stringify({ ts, price }));
-      await redis.ltrim(key, 0, TICK_HISTORY_LIMIT - 1);
-      lastHistoryPush[symbol] = ts;
-    } catch (err) {
-      logEvent("ERR", `Failed to save tick for ${symbol}`, err.message);
-    }
-  }
-}
-
-async function preloadTicks(symbols) {
-  for (const sym of symbols) {
-    const ticks = await redis.lrange(`ticks:${sym}`, 0, 1);
-    if (ticks.length > 0) {
-      const last = JSON.parse(ticks[0]);
-      bufferPrice(sym, last.price, last.ts);
-    }
-  }
-  logEvent("INIT", "Preloaded ticks from Redis");
-}
-
-// ===== BROADCAST =====
-function throttledBroadcast(msg) {
-  const now = Date.now();
-  if (now - TPS_BUCKET.ts > 1000) {
-    TPS_BUCKET.ts = now;
-    TPS_BUCKET.count = 0;
-  }
-  if (TPS_BUCKET.count >= MAX_BROADCAST_TPS) return;
-  TPS_BUCKET.count++;
-  broadcast(msg);
-}
-
-function broadcast(msg) {
-  const data = JSON.stringify(msg);
-  for (const client of wss.clients) {
-    if (client.readyState !== WebSocket.OPEN) continue;
-    if (!client.subscriptions || client.subscriptions.has(msg.symbol)) {
-      if (client.bufferedAmount < 1e6) {
-        client.send(data);
-      }
-    }
-  }
-}
-
 // ===== Express =====
 const app = express();
 app.use(cors());
@@ -147,7 +73,7 @@ app.use(express.json());
 app.use(
   rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 100,
+    max: 200,
   })
 );
 
@@ -164,7 +90,7 @@ function requireApiKey(req, res, next) {
   next();
 }
 
-// ===== REST =====
+// ===== REST Endpoints =====
 app.get("/prices", requireApiKey, async (req, res) => {
   try {
     const symbols =
@@ -238,82 +164,35 @@ app.get("/metrics", async (req, res) => {
 const wss = new WebSocket.Server({ noServer: true });
 function heartbeat() { this.isAlive = true; }
 
-// ===== Resilient Feeds =====
-function resilientWS(url, onMessage, label, normSymbol, exchange) {
-  let ws;
-  function connect() {
-    ws = new WebSocket(url);
-    ws.on("open", () => {
-      logEvent("FEED", `Connected ${label}`);
-      feedHealth.set({ symbol: normSymbol, exchange }, 1);
-    });
-    ws.on("message", onMessage);
-    ws.on("close", () => {
-      logEvent("FEED", `${label} closed. Reconnecting...`);
-      feedHealth.set({ symbol: normSymbol, exchange }, 0);
-      setTimeout(connect, 3000);
-    });
-    ws.on("error", (err) => {
-      logEvent("ERR", `${label} error`, err.message);
-      ws.close();
-    });
+// ===== Redis Subscriptions (from publisher.js) =====
+redisSub.subscribe("price_ticks", () => logEvent("INIT", "Subscribed price_ticks"));
+redisSub.subscribe("orderbook_updates", () => logEvent("INIT", "Subscribed orderbook_updates"));
+
+redisSub.on("message", (channel, msg) => {
+  try {
+    const data = JSON.parse(msg);
+    if (channel === "price_ticks") {
+      ticksPublished.inc({ symbol: data.symbol });
+      feedHealth.set({ symbol: data.symbol, exchange: "binance" }, 1);
+      broadcast({ type: "price", ...data });
+    }
+    if (channel === "orderbook_updates") {
+      broadcast({ type: "orderbook", ...data });
+    }
+  } catch (err) {
+    logEvent("ERR", "Redis sub parse error", err.message);
   }
-  connect();
-}
+});
 
-function startBinanceTrade(binanceSymbol) {
-  const norm = normalizeSymbol(`BINANCE:${binanceSymbol}`);
-  resilientWS(
-    `wss://stream.binance.com:9443/ws/${binanceSymbol.toLowerCase()}@trade`,
-    async (msg) => {
-      try {
-        const data = JSON.parse(msg);
-        const price = parseFloat(data.p);
-        const ts = Date.now();
-        if (!CONTRACTS[norm]) return;
-        const tick = { symbol: norm, raw: binanceSymbol, price, ts };
-        bufferPrice(norm, price, ts);
-        addTick(norm, price, ts);
-        saveTickHistoryThrottled(norm, price, ts);
-        throttledBroadcast({ type: "price", ...tick });
-        processTick(norm, price);
-        ticksPublished.inc({ symbol: norm });
-        await redis.publish("price_ticks", JSON.stringify(tick));
-      } catch (e) {
-        logEvent("ERR", "Binance trade parse failed", e.message);
-      }
-    },
-    `Trade ${binanceSymbol}`,
-    norm,
-    "binance"
-  );
-}
-
-function startBinanceOrderbook(binanceSymbol) {
-  const norm = normalizeSymbol(`BINANCE:${binanceSymbol}`);
-  resilientWS(
-    `wss://stream.binance.com:9443/ws/${binanceSymbol.toLowerCase()}@depth10@100ms`,
-    async (msg) => {
-      try {
-        const data = JSON.parse(msg);
-        const ts = Date.now();
-        if (!CONTRACTS[norm]) return;
-        const ob = {
-          bids: data.bids.map(([p, q]) => [parseFloat(p), parseFloat(q)]),
-          asks: data.asks.map(([p, q]) => [parseFloat(p), parseFloat(q)]),
-          ts, symbol: norm, raw: binanceSymbol,
-        };
-        await redis.set(`orderbook:${norm}`, JSON.stringify(ob), "EX", 10);
-        await redis.publish(`orderbook_${norm}`, JSON.stringify(ob));
-        throttledBroadcast({ type: "orderbook", ...ob });
-      } catch (e) {
-        logEvent("ERR", "Binance orderbook parse failed", e.message);
-      }
-    },
-    `OB ${binanceSymbol}`,
-    norm,
-    "binance"
-  );
+// ===== Broadcast =====
+function broadcast(msg) {
+  const data = JSON.stringify(msg);
+  for (const client of wss.clients) {
+    if (client.readyState !== WebSocket.OPEN) continue;
+    if (!client.subscriptions || client.subscriptions.has(msg.symbol)) {
+      if (client.bufferedAmount < 1e6) client.send(data);
+    }
+  }
 }
 
 // ===== Whitelist Init =====
@@ -323,40 +202,25 @@ async function initWhitelist() {
       .from("instruments")
       .select("feed_code")
       .eq("is_active", true);
+
     if (instruments?.length) {
       setWhitelist(instruments.map((i) => normalizeSymbol(i.feed_code)));
     } else {
-      setWhitelist(["BTCUSD", "ETHUSD", "XAUUSD"]);
+      logEvent("WARN", "Supabase empty, using fallback symbols");
+      setWhitelist(["BINANCE:BTCUSDT", "BINANCE:ETHUSDT", "BINANCE:XAUUSDT"]);
     }
     logEvent("INIT", `Whitelist: ${Array.from(WHITELIST).join(", ")}`);
   } catch (err) {
     logEvent("ERR", "Failed to init whitelist", err.message);
+    setWhitelist(["BINANCE:BTCUSDT", "BINANCE:ETHUSDT", "BINANCE:XAUUSDT"]);
   }
 }
 
 // ===== Startup =====
 const server = app.listen(PORT, "0.0.0.0", async () => {
   logEvent("START", `Price Server running on ${PORT}`);
-  setBroadcaster((msg) => throttledBroadcast(msg));
-
-  try {
-    await initWhitelist();
-    const { data: instruments } = await supabase
-      .from("instruments")
-      .select("feed_code")
-      .eq("is_active", true);
-    const syms = instruments?.map((i) => i.feed_code) || [];
-    await preloadTicks(syms);
-    for (const inst of syms) {
-      const [ex, pair] = inst.split(":");
-      if (ex === "BINANCE") {
-        startBinanceTrade(pair.toUpperCase());
-        startBinanceOrderbook(pair.toUpperCase());
-      }
-    }
-  } catch (err) {
-    logEvent("ERR", "Init failed", err.message);
-  }
+  setBroadcaster((msg) => broadcast(msg));
+  await initWhitelist();
 });
 
 // ===== WS Auth =====
@@ -374,7 +238,7 @@ server.on("upgrade", (req, socket, head) => {
   } else socket.destroy();
 });
 
-wss.on("connection", async (ws, req) => {
+wss.on("connection", async (ws) => {
   ws.isAlive = true;
   ws.subscriptions = new Set();
   ws.on("pong", heartbeat);
@@ -389,7 +253,7 @@ wss.on("connection", async (ws, req) => {
     orderbooks[sym] = obRaw ? JSON.parse(obRaw) : { bids: [], asks: [] };
   }
 
-  ws.send(JSON.stringify({ type: "welcome", prices, orderbooks })); // ✅ FIXED
+  ws.send(JSON.stringify({ type: "welcome", prices, orderbooks }));
   wsConnections.inc();
   ws.on("close", () => wsConnections.dec());
   ws.on("message", async (msg) => {

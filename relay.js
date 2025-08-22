@@ -1,11 +1,13 @@
-// relay.js — WebSocket relay for frontend clients (prop-firm style, heartbeat + per-symbol rate limiting)
+// relay.js — WebSocket relay for frontend clients (prop-firm style, heartbeat + per-symbol rate limiting + API key auth)
 
 require("dotenv").config();
 const WebSocket = require("ws");
 const Redis = require("ioredis");
 const http = require("http");
+const url = require("url");
 
 const redisUrl = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+const FEED_API_KEY = process.env.FEED_API_KEY || "supersecret";
 
 // ===== Redis connections =====
 const redisSub = new Redis(redisUrl, {
@@ -22,7 +24,7 @@ redisCli.on("error", (err) => console.error("[RedisCli] ❌", err));
 
 // ===== WebSocket server =====
 const server = http.createServer();
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ noServer: true });
 
 const PORT = process.env.RELAY_PORT || 8080;
 const HEARTBEAT_INTERVAL = 30000; // 30s like real firms
@@ -35,10 +37,28 @@ const channels = [
   "orderbook_XAUUSDT",
 ];
 
-// Attach isAlive + per-symbol rate limit map to each client
+// ===== Heartbeat =====
 function heartbeat() {
   this.isAlive = true;
 }
+
+// ===== Upgrade handler with API key auth =====
+server.on("upgrade", (req, socket, head) => {
+  const query = url.parse(req.url, true).query;
+  const headerKey = req.headers["sec-websocket-protocol"];
+  const token = query.key || query.token || headerKey;
+
+  if (token !== FEED_API_KEY) {
+    console.warn("🚫 WS auth failed:", req.socket.remoteAddress);
+    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit("connection", ws, req);
+  });
+});
 
 wss.on("connection", async (ws) => {
   console.log("🌐 New WS client connected");
@@ -123,7 +143,7 @@ redisSub.on("message", (channel, message) => {
   });
 });
 
-// ===== Heartbeat =====
+// ===== Heartbeat loop =====
 const interval = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) {
@@ -139,5 +159,5 @@ wss.on("close", () => clearInterval(interval));
 
 // ===== Start server =====
 server.listen(PORT, () => {
-  console.log(`🚀 Relay server listening on ws://localhost:${PORT}`);
+  console.log(`🚀 Relay server listening on ws://localhost:${PORT} (auth required)`);
 });

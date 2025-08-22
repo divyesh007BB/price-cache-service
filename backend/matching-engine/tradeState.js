@@ -33,7 +33,12 @@ function addOpenTrade(trade) {
 }
 
 function removeOpenTrade(tradeId) {
-  openTrades = openTrades.filter(t => t.id !== tradeId);
+  openTrades = openTrades.filter((t) => t.id !== tradeId);
+}
+
+function updateAccount(accountId, updated) {
+  accounts = accounts.map((a) => (a.id === accountId ? { ...a, ...updated } : a));
+  return accounts.find((a) => a.id === accountId);
 }
 
 module.exports = {
@@ -43,4 +48,5 @@ module.exports = {
   setAccounts,
   addOpenTrade,
   removeOpenTrade,
+  updateAccount,
 };

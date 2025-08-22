@@ -1,0 +1,27 @@
+# Dockerfile.relay — Aroha Relay
+FROM node:20-alpine
+
+# Set working dir
+WORKDIR /app
+
+# Copy package.json + lock
+COPY package*.json ./
+
+# Install deps + pm2
+RUN npm install --only=production && npm install -g pm2
+
+# Copy backend source (relay also uses shared libs + matching-engine sometimes)
+COPY backend/shared ./backend/shared
+COPY backend/matching-engine ./backend/matching-engine
+
+# Copy relay source (update if relay is in backend/relay/index.js instead of root)
+COPY relay.js ./relay.js
+
+# Environment
+ENV NODE_ENV=production
+
+# Expose relay port
+EXPOSE 8080
+
+# Run relay
+CMD ["pm2-runtime", "relay.js"]

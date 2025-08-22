@@ -1,22 +1,10 @@
-// symbolMap.js — Phase 1: NIFTY + Binance BTC, Gold, EUR, GBP
+// symbolMap.js — Unified Symbols (BTCUSD, ETHUSD, XAUUSD, NIFTY, USDINR)
+
 const { supabaseClient } = require("./supabaseClient"); // ✅ service role client
 
 // ===== Local contract meta (defaults) =====
 const CONTRACTS = {
-  NIFTY: {
-    qtyStep: 1,
-    minQty: 1,
-    priceKey: "NSE:NIFTY",
-    display: "NIFTY",
-    tickValue: 50,
-    convertToINR: true,
-    maxLots: { Evaluation: 20, Funded: 50 },
-    tradingHours: { start: 3.5, end: 10.5 }, // IST hours (UTC+5:30)
-    dailyLossLimit: 100000,
-    commission: 50,
-    spread: 0.5,
-  },
-  "BINANCE:BTCUSDT": {
+  BTCUSD: {
     qtyStep: 0.01,
     minQty: 0.01,
     priceKey: "BINANCE:BTCUSDT",
@@ -29,7 +17,20 @@ const CONTRACTS = {
     commission: 50,
     spread: 5,
   },
-  "BINANCE:XAUUSDT": {
+  ETHUSD: {
+    qtyStep: 0.01,
+    minQty: 0.01,
+    priceKey: "BINANCE:ETHUSDT",
+    display: "Ethereum (ETH/USD)",
+    tickValue: 100,
+    convertToINR: false,
+    maxLots: { Evaluation: 5, Funded: 10 },
+    tradingHours: { start: 0, end: 24 },
+    dailyLossLimit: 150000,
+    commission: 30,
+    spread: 1,
+  },
+  XAUUSD: {
     qtyStep: 0.01,
     minQty: 0.01,
     priceKey: "BINANCE:XAUUSDT",
@@ -42,68 +43,60 @@ const CONTRACTS = {
     commission: 30,
     spread: 0.5,
   },
-  "BINANCE:EURUSDT": {
-    qtyStep: 0.001,
-    minQty: 0.001,
-    priceKey: "BINANCE:EURUSDT",
-    display: "Euro (EUR/USD)",
-    tickValue: 1,
-    convertToINR: false,
-    maxLots: { Evaluation: 5, Funded: 10 },
-    tradingHours: { start: 0, end: 24 },
+  NIFTY: {
+    qtyStep: 1,
+    minQty: 1,
+    priceKey: "NSE:NIFTY",
+    display: "NIFTY",
+    tickValue: 50,
+    convertToINR: true,
+    maxLots: { Evaluation: 20, Funded: 50 },
+    tradingHours: { start: 3.5, end: 10.5 }, // IST hours
     dailyLossLimit: 100000,
-    commission: 20,
-    spread: 0.0001,
+    commission: 50,
+    spread: 0.5,
   },
-  "BINANCE:GBPUSDT": {
-    qtyStep: 0.001,
-    minQty: 0.001,
-    priceKey: "BINANCE:GBPUSDT",
-    display: "British Pound (GBP/USD)",
+  USDINR: {
+    qtyStep: 1,
+    minQty: 1,
+    priceKey: "FX:USDINR",
+    display: "USD/INR",
     tickValue: 1,
-    convertToINR: false,
-    maxLots: { Evaluation: 5, Funded: 10 },
+    convertToINR: false, // ✅ only used for conversion, not tradable
+    maxLots: { Evaluation: 0, Funded: 0 },
     tradingHours: { start: 0, end: 24 },
-    dailyLossLimit: 100000,
-    commission: 20,
-    spread: 0.0001,
+    dailyLossLimit: 0,
+    commission: 0,
+    spread: 0,
   },
 };
 
 // ===== Feed + alias map =====
 const FEED_SYMBOL_MAP = {
-  // NIFTY
-  "NSE:NIFTY": "NIFTY",
-  NSENIFTY: "NIFTY",
-  NIFTY: "NIFTY",
-
   // BTC
-  "BINANCE:BTCUSDT": "BINANCE:BTCUSDT",
-  BINANCEBTCUSDT: "BINANCE:BTCUSDT",
-  BTCUSD: "BINANCE:BTCUSDT",   // ✅ alias
-  BTCUSDT: "BINANCE:BTCUSDT",  // ✅ alias
-  BTC: "BINANCE:BTCUSDT",
+  "BINANCE:BTCUSDT": "BTCUSD",
+  BTCUSD: "BTCUSD",
+  BTCUSDT: "BTCUSD",
+  BTC: "BTCUSD",
+
+  // ETH
+  "BINANCE:ETHUSDT": "ETHUSD",
+  ETHUSD: "ETHUSD",
+  ETHUSDT: "ETHUSD",
 
   // GOLD
-  "BINANCE:XAUUSDT": "BINANCE:XAUUSDT",
-  BINANCEXAUUSDT: "BINANCE:XAUUSDT",
-  XAUUSD: "BINANCE:XAUUSDT",   // ✅ alias
-  GOLD: "BINANCE:XAUUSDT",
+  "BINANCE:XAUUSDT": "XAUUSD",
+  XAUUSD: "XAUUSD",
+  GOLD: "XAUUSD",
 
-  // EUR
-  "BINANCE:EURUSDT": "BINANCE:EURUSDT",
-  BINANCEEURUSDT: "BINANCE:EURUSDT",
-  EURUSD: "BINANCE:EURUSDT",   // ✅ alias
+  // NIFTY
+  "NSE:NIFTY": "NIFTY",
+  NIFTY: "NIFTY",
+  NSENIFTY: "NIFTY",
 
-  // GBP
-  "BINANCE:GBPUSDT": "BINANCE:GBPUSDT",
-  BINANCEGBPUSDT: "BINANCE:GBPUSDT",
-  GBPUSD: "BINANCE:GBPUSDT",   // ✅ alias
-
-  // ETH (future-proof if you add it)
-  "BINANCE:ETHUSDT": "BINANCE:ETHUSDT",
-  ETHUSD: "BINANCE:ETHUSDT",
-  ETHUSDT: "BINANCE:ETHUSDT",
+  // USDINR
+  "FX:USDINR": "USDINR",
+  USDINR: "USDINR",
 };
 
 // ===== Utils =====
@@ -111,10 +104,8 @@ function normalizeSymbol(symbol) {
   if (!symbol) return "";
   const upper = symbol.toUpperCase();
 
-  // Direct match
   if (FEED_SYMBOL_MAP[upper]) return FEED_SYMBOL_MAP[upper];
 
-  // Strip colons/underscores (BTC_USDT → BTCUSDT)
   const stripped = upper.replace(/[:_]/g, "");
   if (FEED_SYMBOL_MAP[stripped]) return FEED_SYMBOL_MAP[stripped];
 
@@ -136,7 +127,6 @@ function isWithinTradingHours(symbol, now = new Date()) {
   if (start <= end) {
     return utcHours >= start && utcHours < end;
   } else {
-    // Handles overnight sessions (e.g., 22 → 5)
     return utcHours >= start || utcHours < end;
   }
 }
