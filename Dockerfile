@@ -14,8 +14,10 @@ COPY backend/price-server ./backend/price-server
 COPY backend/matching-engine ./backend/matching-engine
 COPY backend/shared ./backend/shared
 
-# 👇 Copy relay.js from project root into container
+# Copy standalone scripts
 COPY relay.js ./relay.js
+COPY backend/price-server/publisher.js ./publisher.js
+
 
 # Environment
 ENV NODE_ENV=production

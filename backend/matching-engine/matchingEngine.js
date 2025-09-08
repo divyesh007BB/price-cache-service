@@ -1,4 +1,4 @@
-// backend/matching-engine/matchingEngine.js — Real Prop Firm Execution Engine (Topstep/FTMO style)
+// backend/matching-engine/matchingEngine.js — Real Prop Firm Execution Engine (Topstep/FTMO style, depth-based)
 
 require("dotenv").config();
 const { v4: uuidv4 } = require("uuid");
@@ -29,6 +29,9 @@ const {
   removeOpenTrade,
   updateAccount,
 } = require("./tradeState");
+
+// ✅ Depth-based order book
+const { updateOrderBook, matchOrder } = require("./orderBook");
 
 // ---------- Local State ----------
 let wsBroadcast = () => {};
@@ -96,6 +99,7 @@ async function loadInitialData() {
   }
 
   subscribePriceFeed();
+  subscribeOrderBook();
   console.log(
     `✅ Loaded ${getAccounts().length} accounts, ${pendingOrders.length} pending orders, ${getOpenTrades().length} open trades`
   );
@@ -125,7 +129,7 @@ function broadcastSnapshot() {
 }
 
 // ===================================
-// PRICE SUBSCRIPTION (Redis Pub/Sub)
+// PRICE SUBSCRIPTION
 // ===================================
 async function subscribePriceFeed() {
   const sub = redis.duplicate();
@@ -143,6 +147,25 @@ async function subscribePriceFeed() {
     }
   });
   console.log("📡 Subscribed to Redis/KeyDB 'price_ticks'");
+}
+
+// ===================================
+// ORDERBOOK SUBSCRIPTION
+// ===================================
+async function subscribeOrderBook() {
+  const sub = redis.duplicate();
+  await sub.subscribe("orderbook_updates");
+  sub.on("message", (ch, msg) => {
+    if (ch === "orderbook_updates") {
+      try {
+        const { symbol, bids, asks } = JSON.parse(msg);
+        updateOrderBook(normalizeSymbol(symbol), bids, asks);
+      } catch (err) {
+        console.error("❌ OrderBook parse error:", err.message);
+      }
+    }
+  });
+  console.log("📡 Subscribed to Redis/KeyDB 'orderbook_updates'");
 }
 
 // ===================================
@@ -254,9 +277,7 @@ async function placeOrder(order) {
     }
     if (!cached?.price) return rejectOrder(order, "NO_LIVE_PRICE");
 
-    const execPrice = await convertPrice(order.symbol, cached.price);
     const orderId = uuidv4();
-
     try {
       await supabase.from("orders").insert({
         id: orderId,
@@ -266,19 +287,17 @@ async function placeOrder(order) {
         side: order.side,
         quantity: order.quantity,
         order_type: "market",
-        entry_price: execPrice,
-        status: "filled",
+        status: "pending", // will be filled below
         created_at: new Date().toISOString(),
-        filled_at: new Date().toISOString(),
       });
     } catch (err) {
       console.error("❌ Supabase insert orders:", err.message);
     }
 
-    const postRisk = await evaluateImmediateRisk(order.account_id, order.symbol, order.quantity, execPrice);
+    const postRisk = await evaluateImmediateRisk(order.account_id, order.symbol, order.quantity, cached.price);
     if (!postRisk.ok) return rejectOrder(order, postRisk.error);
 
-    await fillOrder({ ...order, id: orderId }, execPrice, cached.price);
+    await fillOrder({ ...order, id: orderId }, cached.price, cached.price);
   } else {
     const orderId = uuidv4();
     const newOrder = { ...order, id: orderId };
@@ -308,10 +327,10 @@ async function placeOrder(order) {
 }
 
 // ===================================
-// FILL ORDER
+// FILL ORDER (depth-based)
 // ===================================
 async function fillOrder(order, basePrice, prevPrice) {
-  order.symbol = normalizeSymbol(order.symbol); // ✅ normalize here
+  order.symbol = normalizeSymbol(order.symbol);
   const lock = accountLocks.get(order.account_id) || Promise.resolve();
   accountLocks.set(
     order.account_id,
@@ -319,66 +338,57 @@ async function fillOrder(order, basePrice, prevPrice) {
       await new Promise((r) => setTimeout(r, EXECUTION_LATENCY_MS));
 
       const c = getContracts()[order.symbol];
-      const spread = c?.spread || 0;
       const commission = c?.commission || 0;
-      const gap = Math.abs(basePrice - (prevPrice || basePrice));
-      const slippage = gap > 0 ? Math.min(gap * 0.2, c?.maxSlippage || 5) : 0;
 
-      const execPrice = order.side === "buy"
-        ? basePrice + spread + slippage
-        : basePrice - spread - slippage;
-
-      const risk = await evaluateImmediateRisk(order.account_id, order.symbol, order.quantity, execPrice);
-      if (!risk.ok) return rejectOrder(order, risk.error);
-
-      const fillQty = ENABLE_PARTIAL_FILLS
-        ? Math.max(1, Math.floor(order.quantity * (Math.random() * 0.5 + 0.5)))
-        : order.quantity;
-
-      const remainingQty = order.quantity - fillQty;
-
-      const trade = {
-        id: uuidv4(),
-        account_id: order.account_id,
-        user_id: order.user_id,
-        symbol: order.symbol,
-        side: order.side,
-        quantity: fillQty,
-        entry_price: execPrice,
-        stop_loss: order.stop_loss ?? null,
-        take_profit: order.take_profit ?? null,
-        is_open: true,
-        status: "open",
-        time_opened: new Date().toISOString(),
-        pnl: -commission * fillQty,
-        order_id: order.id,
-      };
+      // ✅ Depth-based execution
+      const { fills, remaining } = matchOrder(order);
+      if (fills.length === 0) return rejectOrder(order, "NO_LIQUIDITY");
 
       pendingOrders = pendingOrders.filter((o) => o.id !== order.id);
-      addOpenTrade(trade);
 
-      try {
-        wsBroadcast({ type: "trade_fill", trade });
-        await redis.publish("trade_events", JSON.stringify({ type: "TRADE_OPENED", trade }));
-        await redis.publish("order_events", JSON.stringify({ type: "ORDER_FILLED", order, trade }));
-      } catch {}
-      broadcastSnapshot();
+      for (const f of fills) {
+        const trade = {
+          id: uuidv4(),
+          account_id: order.account_id,
+          user_id: order.user_id,
+          symbol: order.symbol,
+          side: order.side,
+          quantity: f.qty,
+          entry_price: f.price,
+          stop_loss: order.stop_loss ?? null,
+          take_profit: order.take_profit ?? null,
+          is_open: true,
+          status: "open",
+          time_opened: new Date().toISOString(),
+          pnl: -commission * f.qty,
+          order_id: order.id,
+        };
 
-      try {
-        await supabase.from("orders").update({
-          status: remainingQty > 0 ? "partially_filled" : "filled",
-          entry_price: execPrice,
-          filled_at: new Date().toISOString(),
-        }).eq("id", order.id);
-        await supabase.from("trades").insert(trade);
-      } catch (err) {
-        console.error("❌ Supabase trade insert:", err.message);
+        addOpenTrade(trade);
+
+        try {
+          wsBroadcast({ type: "trade_fill", trade });
+          await redis.publish("trade_events", JSON.stringify({ type: "TRADE_OPENED", trade }));
+          await redis.publish("order_events", JSON.stringify({ type: "ORDER_FILLED", order, trade }));
+        } catch {}
+        broadcastSnapshot();
+
+        try {
+          await supabase.from("orders").update({
+            status: remaining > 0 ? "partially_filled" : "filled",
+            entry_price: f.price,
+            filled_at: new Date().toISOString(),
+          }).eq("id", order.id);
+          await supabase.from("trades").insert(trade);
+        } catch (err) {
+          console.error("❌ Supabase trade insert:", err.message);
+        }
+
+        await auditLog("ORDER_FILLED", { order, trade });
       }
 
-      await auditLog("ORDER_FILLED", { order, trade });
-
-      if (remainingQty > 0) {
-        const restOrder = { ...order, id: uuidv4(), quantity: remainingQty };
+      if (remaining > 0) {
+        const restOrder = { ...order, id: uuidv4(), quantity: remaining };
         pendingOrders.push(restOrder);
         try {
           wsBroadcast({ type: "order_pending", order: restOrder });
@@ -393,7 +403,7 @@ async function fillOrder(order, basePrice, prevPrice) {
 // CLOSE TRADE
 // ===================================
 async function closeTrade(trade, closePrice, reason = null) {
-  trade.symbol = normalizeSymbol(trade.symbol); // ✅ normalize here
+  trade.symbol = normalizeSymbol(trade.symbol);
   const tickValue = getContracts()[trade.symbol]?.tickValue ?? 1;
   const pnl = trade.side === "buy"
     ? (closePrice - trade.entry_price) * trade.quantity * tickValue
@@ -512,7 +522,4 @@ module.exports = {
   processTick,
   placeOrder,
   fillOrder,
-  closeTrade,
-  getOpenTrades,
-  getAccounts,
-};
+  close

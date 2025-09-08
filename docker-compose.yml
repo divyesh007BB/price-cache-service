@@ -4,7 +4,7 @@ services:
   # ===========================
   # KeyDB (Redis-compatible)
   # ===========================
-  aroha-keydb:
+  keydb:
     image: eqalpha/keydb:latest
     container_name: aroha-keydb
     restart: unless-stopped
@@ -27,6 +27,32 @@ services:
         max-file: "3"
 
   # ===========================
+  # Publisher (Binance Feed → Redis)
+  # ===========================
+  aroha-publisher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aroha-publisher
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      - NODE_ENV=production
+      - REDIS_URL=redis://aroha-keydb:6379   # 🔥 fixed
+    depends_on:
+      keydb:
+        condition: service_healthy
+    command: ["node", "/app/backend/price-server/publisher.js"]
+    networks:
+      - aroha-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ===========================
   # Price Server (WS + REST API)
   # ===========================
   aroha-price-server:
@@ -40,10 +66,12 @@ services:
     environment:
       - PORT=4000
       - NODE_ENV=production
-      - REDIS_URL=redis://aroha-keydb:6379
+      - REDIS_URL=redis://aroha-keydb:6379   # 🔥 fixed
     depends_on:
-      aroha-keydb:
+      keydb:
         condition: service_healthy
+      aroha-publisher:
+        condition: service_started
     ports:
       - "4000:4000"
     command: ["pm2-runtime", "/app/backend/price-server/index.js"]
@@ -73,7 +101,7 @@ services:
       - ./.env
     environment:
       - NODE_ENV=production
-      - REDIS_URL=redis://aroha-keydb:6379
+      - REDIS_URL=redis://aroha-keydb:6379   # 🔥 fixed
     depends_on:
       aroha-price-server:
         condition: service_started
@@ -81,7 +109,7 @@ services:
     networks:
       - aroha-net
     healthcheck:
-      test: ["CMD", "redis-cli", "-h", "aroha-keydb", "ping"]
+      test: ["CMD", "redis-cli", "-h", "aroha-keydb", "ping"]   # 🔥 fixed
       interval: 20s
       timeout: 5s
       retries: 5
@@ -104,7 +132,7 @@ services:
       - ./.env
     environment:
       - NODE_ENV=production
-      - REDIS_URL=redis://aroha-keydb:6379
+      - REDIS_URL=redis://aroha-keydb:6379   # 🔥 fixed
     depends_on:
       aroha-matching-engine:
         condition: service_started
@@ -112,7 +140,7 @@ services:
     networks:
       - aroha-net
     healthcheck:
-      test: ["CMD", "redis-cli", "-h", "aroha-keydb", "ping"]
+      test: ["CMD", "redis-cli", "-h", "aroha-keydb", "ping"]   # 🔥 fixed
       interval: 20s
       timeout: 5s
       retries: 5
@@ -135,7 +163,7 @@ services:
       - ./.env
     environment:
       - NODE_ENV=production
-      - REDIS_URL=redis://aroha-keydb:6379
+      - REDIS_URL=redis://aroha-keydb:6379   # 🔥 fixed
     depends_on:
       aroha-price-server:
         condition: service_started
@@ -143,7 +171,7 @@ services:
     networks:
       - aroha-net
     healthcheck:
-      test: ["CMD", "redis-cli", "-h", "aroha-keydb", "ping"]
+      test: ["CMD", "redis-cli", "-h", "aroha-keydb", "ping"]   # 🔥 fixed
       interval: 20s
       timeout: 5s
       retries: 5
@@ -167,11 +195,11 @@ services:
     environment:
       - NODE_ENV=production
       - RELAY_PORT=8080
-      - REDIS_URL=redis://aroha-keydb:6379
+      - REDIS_URL=redis://aroha-keydb:6379   # 🔥 fixed
     depends_on:
-      aroha-keydb:
+      keydb:
         condition: service_healthy
-    command: ["pm2-runtime", "/app/relay.js"]
+    command: ["node", "/app/relay.js"]
     ports:
       - "8080:8080"
     networks:
@@ -195,13 +223,13 @@ services:
     container_name: aroha-redis-exporter
     restart: unless-stopped
     environment:
-      - REDIS_ADDR=redis://aroha-keydb:6379
+      - REDIS_ADDR=redis://aroha-keydb:6379   # 🔥 fixed
     ports:
       - "9121:9121"
     networks:
       - aroha-net
     depends_on:
-      - aroha-keydb
+      - keydb
     logging:
       driver: "json-file"
       options:

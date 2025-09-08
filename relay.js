@@ -1,4 +1,4 @@
-// relay.js — WebSocket relay for frontend clients (prop-firm style, heartbeat + per-symbol rate limiting + API key auth)
+// relay.js — WebSocket relay for frontend clients (normalized symbols only, clean payloads)
 
 require("dotenv").config();
 const WebSocket = require("ws");
@@ -10,14 +10,8 @@ const redisUrl = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 const FEED_API_KEY = process.env.FEED_API_KEY || "supersecret";
 
 // ===== Redis connections =====
-const redisSub = new Redis(redisUrl, {
-  maxRetriesPerRequest: null,
-  enableReadyCheck: true,
-});
-const redisCli = new Redis(redisUrl, {
-  maxRetriesPerRequest: null,
-  enableReadyCheck: true,
-});
+const redisSub = new Redis(redisUrl, { maxRetriesPerRequest: null, enableReadyCheck: true });
+const redisCli = new Redis(redisUrl, { maxRetriesPerRequest: null, enableReadyCheck: true });
 
 redisSub.on("error", (err) => console.error("[RedisSub] ❌", err));
 redisCli.on("error", (err) => console.error("[RedisCli] ❌", err));
@@ -27,14 +21,15 @@ const server = http.createServer();
 const wss = new WebSocket.Server({ noServer: true });
 
 const PORT = process.env.RELAY_PORT || 8080;
-const HEARTBEAT_INTERVAL = 30000; // 30s like real firms
-const MAX_TICKS_PER_SECOND = 20;  // per symbol per client
+const HEARTBEAT_INTERVAL = 30000;
+const MAX_TICKS_PER_SECOND = 20;
 
+// ✅ Normalized channels (match publisher)
 const channels = [
   "price_ticks",
-  "orderbook_BTCUSDT",
-  "orderbook_ETHUSDT",
-  "orderbook_XAUUSDT",
+  "orderbook_BTCUSD",
+  "orderbook_ETHUSD",
+  "orderbook_XAUUSD",
 ];
 
 // ===== Heartbeat =====
@@ -46,7 +41,9 @@ function heartbeat() {
 server.on("upgrade", (req, socket, head) => {
   const query = url.parse(req.url, true).query;
   const headerKey = req.headers["sec-websocket-protocol"];
-  const token = query.key || query.token || headerKey;
+
+  // ✅ Accept ?api_key=, ?key=, ?token=, or header
+  const token = query.key || query.token || query.api_key || headerKey;
 
   if (token !== FEED_API_KEY) {
     console.warn("🚫 WS auth failed:", req.socket.remoteAddress);
@@ -60,26 +57,34 @@ server.on("upgrade", (req, socket, head) => {
   });
 });
 
+// ===== Connections =====
 wss.on("connection", async (ws) => {
   console.log("🌐 New WS client connected");
   ws.isAlive = true;
-
-  // Rate limit trackers: { symbol: { lastTime, tickCount } }
   ws.rateLimit = {};
-
   ws.on("pong", heartbeat);
 
-  // On connect: send snapshots
   try {
+    // ✅ Snapshot of latest prices
     const latest = await redisCli.hgetall("latest_prices");
     if (latest && Object.keys(latest).length > 0) {
-      ws.send(JSON.stringify({ type: "latest_prices", data: latest }));
+      const parsed = {};
+      Object.entries(latest).forEach(([sym, str]) => {
+        try {
+          parsed[sym] = JSON.parse(str);
+        } catch {
+          parsed[sym] = str;
+        }
+      });
+      ws.send(JSON.stringify({ type: "latest_prices", data: parsed }));
     }
 
+    // ✅ Snapshot of orderbooks
     for (let c of channels.slice(1)) {
       const snap = await redisCli.get(c);
       if (snap) {
-        ws.send(JSON.stringify({ type: c, data: JSON.parse(snap) }));
+        const symbol = c.split("_")[1]; // e.g. orderbook_BTCUSD → BTCUSD
+        ws.send(JSON.stringify({ type: "orderbook", symbol, ...JSON.parse(snap) }));
       }
     }
   } catch (err) {
@@ -107,41 +112,43 @@ redisSub.on("message", (channel, message) => {
     return;
   }
 
-  // Identify symbol for per-symbol rate limiting
-  let symbol = "";
-  if (parsed.symbol) {
-    symbol = parsed.symbol.toUpperCase();
+  if (channel === "price_ticks") {
+    const payload = {
+      type: "price",
+      symbol: parsed.symbol, // already normalized
+      price: parsed.price,
+      ts: parsed.ts,
+    };
+    broadcast(payload, parsed.symbol);
   } else if (channel.startsWith("orderbook_")) {
-    symbol = channel.replace("orderbook_", "").toUpperCase();
-  } else {
-    symbol = channel.toUpperCase();
+    const symbol = channel.split("_")[1];
+    const payload = { type: "orderbook", symbol, ...parsed };
+    broadcast(payload, symbol);
   }
+});
 
-  const payload = { type: channel, data: message };
+// ===== Broadcast with per-symbol rate limiting =====
+function broadcast(payload, symbol = "") {
   const now = Date.now();
-
   wss.clients.forEach((client) => {
     if (client.readyState !== WebSocket.OPEN) return;
 
-    if (!client.rateLimit[symbol]) {
-      client.rateLimit[symbol] = { lastTime: now, tickCount: 0 };
-    }
-
-    const rl = client.rateLimit[symbol];
-    if (now - rl.lastTime > 1000) {
-      rl.lastTime = now;
-      rl.tickCount = 0;
-    }
-
-    rl.tickCount++;
-    if (rl.tickCount > MAX_TICKS_PER_SECOND) {
-      // drop tick if over limit
-      return;
+    if (symbol) {
+      if (!client.rateLimit[symbol]) {
+        client.rateLimit[symbol] = { lastTime: now, tickCount: 0 };
+      }
+      const rl = client.rateLimit[symbol];
+      if (now - rl.lastTime > 1000) {
+        rl.lastTime = now;
+        rl.tickCount = 0;
+      }
+      rl.tickCount++;
+      if (rl.tickCount > MAX_TICKS_PER_SECOND) return;
     }
 
     client.send(JSON.stringify(payload));
   });
-});
+}
 
 // ===== Heartbeat loop =====
 const interval = setInterval(() => {

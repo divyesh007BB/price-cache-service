@@ -1,19 +1,18 @@
-// publisher.js — Production Price Publisher (Binance → Redis)
-// ✅ Run this as a separate service, NOT inside price-server.
+// publisher.js — Production Price Publisher (Binance → KeyDB, normalized symbols only)
+// Run as its own container (aroha-publisher)
 
 require("dotenv").config();
 const WebSocket = require("ws");
 const Redis = require("ioredis");
-const fetch = require("node-fetch");
 const dayjs = require("dayjs");
 
 // ===== CONFIG =====
-const redisUrl = process.env.REDIS_URL;
-const BINANCE_PAIRS = ["BTCUSDT", "ETHUSDT", "XAUUSDT"]; // add more later
-const PUB_CHANNEL = "price_ticks";
-const ORDERBOOK_CHANNEL = "orderbook_updates";
-const TICK_HISTORY_LIMIT = 1000; // keep last 1000 ticks per symbol
-const ORDERBOOK_BATCH_MS = 500;  // batch orderbook updates every 500ms
+const redisUrl = process.env.REDIS_URL || "redis://aroha-keydb:6379";
+const BINANCE_PAIRS = ["BTCUSDT", "ETHUSDT", "XAUUSDT"];
+const PUB_CHANNEL = "price_ticks"; // ticks
+const TICK_HISTORY_LIMIT = 1000;
+const ORDERBOOK_BATCH_MS = 500;
+const HEARTBEAT_TIMEOUT = 15000; // 15s watchdog
 
 // ===== Redis =====
 const redis = new Redis(redisUrl, {
@@ -26,17 +25,28 @@ function logEvent(type, msg, extra) {
   console.log(`[${dayjs().format("YYYY-MM-DD HH:mm:ss")}] [${type}] ${msg}`, extra || "");
 }
 
-// ===== Price History Cache =====
-const tickHistory = {}; // { symbol: [ {price, ts}, ... ] }
-const latestPrices = {}; // { symbol: {price, ts} }
-const orderbookBuffer = {}; // batch OB updates
+// ===== Normalization =====
+function normalizeSymbol(symbol) {
+  if (!symbol) return "UNKNOWN";
+  const s = symbol.toUpperCase();
+  if (s === "BTCUSDT") return "BTCUSD";
+  if (s === "ETHUSDT") return "ETHUSD";
+  if (s === "XAUUSDT") return "XAUUSD";
+  return s;
+}
 
-// ===== Save tick to Redis =====
-async function saveTick(symbol, price) {
+// ===== Local caches =====
+let tickHistory = {};
+let latestPrices = {};
+let orderbookBuffer = {};
+let lastMessageTime = Date.now();
+
+// ===== Save Tick =====
+function saveTick(symbol, price) {
   const ts = Date.now();
-  const normSymbol = `BINANCE:${symbol}`;
+  lastMessageTime = ts; // ✅ update heartbeat
+  const normSymbol = normalizeSymbol(symbol);
 
-  // keep memory cache
   if (!tickHistory[normSymbol]) tickHistory[normSymbol] = [];
   tickHistory[normSymbol].push({ price, ts });
   if (tickHistory[normSymbol].length > TICK_HISTORY_LIMIT) {
@@ -44,34 +54,59 @@ async function saveTick(symbol, price) {
   }
   latestPrices[normSymbol] = { price, ts };
 
-  // publish to Redis
-  await redis.publish(
-    PUB_CHANNEL,
-    JSON.stringify({ type: "price", symbol: normSymbol, price, ts })
-  );
+  logEvent("TICK", `${normSymbol} → ${price}`);
 
-  // save latest to hash for new clients
-  await redis.hset("latest_prices", normSymbol, JSON.stringify({ price, ts }));
+  redis
+    .publish(
+      PUB_CHANNEL,
+      JSON.stringify({
+        type: "price",
+        symbol: normSymbol,
+        price,
+        ts,
+      })
+    )
+    .then((count) => {
+      logEvent("PUB", `Tick ${normSymbol} sent → subs: ${count}`);
+    })
+    .catch((err) => {
+      logEvent("ERROR", `Publish tick ${normSymbol} failed`, err.message);
+    });
+
+  redis.hset("latest_prices", normSymbol, JSON.stringify({ price, ts }));
 }
 
-// ===== Save orderbook to Redis (batched) =====
+// ===== Buffer Orderbook =====
 function bufferOrderbook(symbol, bids, asks) {
-  const normSymbol = `BINANCE:${symbol}`;
+  const normSymbol = normalizeSymbol(symbol);
   orderbookBuffer[normSymbol] = { bids, asks, ts: Date.now() };
+  lastMessageTime = Date.now(); // ✅ update heartbeat
 }
 
-setInterval(async () => {
+// Batch flush orderbooks
+setInterval(() => {
   const batch = { ...orderbookBuffer };
   orderbookBuffer = {};
   for (const [sym, ob] of Object.entries(batch)) {
-    await redis.publish(
-      ORDERBOOK_CHANNEL,
-      JSON.stringify({ type: "orderbook", symbol: sym, ...ob })
-    );
+    logEvent("OB", `Publishing orderbook for ${sym}`);
+    const channel = `orderbook_${sym}`;
+    redis
+      .publish(
+        channel,
+        JSON.stringify({ type: "orderbook", symbol: sym, ...ob })
+      )
+      .then((count) => {
+        logEvent("PUB", `Orderbook ${sym} sent → subs: ${count}`);
+      })
+      .catch((err) => {
+        logEvent("ERROR", `Publish orderbook ${sym} failed`, err.message);
+      });
+
+    redis.set(channel, JSON.stringify(ob));
   }
 }, ORDERBOOK_BATCH_MS);
 
-// ===== Connect to Binance WS =====
+// ===== Binance WS =====
 function connectBinance() {
   const streams = BINANCE_PAIRS.map((s) => `${s.toLowerCase()}@ticker`).join("/");
   const obStreams = BINANCE_PAIRS.map((s) => `${s.toLowerCase()}@depth20@100ms`).join("/");
@@ -82,32 +117,31 @@ function connectBinance() {
 
   ws.on("open", () => {
     logEvent("INFO", "✅ Binance connected");
+    lastMessageTime = Date.now();
   });
 
-  ws.on("message", async (data) => {
+  ws.on("message", (data) => {
     try {
       const msg = JSON.parse(data.toString());
       if (!msg?.data) return;
 
-      const stream = msg.stream;
-      const payload = msg.data;
+      const { stream, data: payload } = msg;
 
-      // --- Ticker ---
       if (stream.includes("@ticker")) {
         const symbol = payload.s;
         const price = parseFloat(payload.c);
-        await saveTick(symbol, price);
+        saveTick(symbol, price);
       }
 
-      // --- Orderbook ---
       if (stream.includes("@depth20")) {
-        const symbol = payload.s;
+        const rawSym = payload.s || stream.split("@")[0].toUpperCase();
+        const symbol = normalizeSymbol(rawSym);
         const bids = payload.bids.map(([p, q]) => [parseFloat(p), parseFloat(q)]);
         const asks = payload.asks.map(([p, q]) => [parseFloat(p), parseFloat(q)]);
         bufferOrderbook(symbol, bids, asks);
       }
     } catch (err) {
-      logEvent("ERROR", "Parse error", err);
+      logEvent("ERROR", "Parse error", err.message);
     }
   });
 
@@ -117,9 +151,20 @@ function connectBinance() {
   });
 
   ws.on("error", (err) => {
-    logEvent("ERROR", "Binance WS error", err);
+    logEvent("ERROR", "Binance WS error", err.message);
     ws.close();
   });
+
+  // ✅ Watchdog: reconnect if no data for > HEARTBEAT_TIMEOUT
+  setInterval(() => {
+    if (Date.now() - lastMessageTime > HEARTBEAT_TIMEOUT) {
+      logEvent("WARN", "⚠️ No messages in 15s, reconnecting...");
+      try {
+        ws.terminate();
+      } catch {}
+      connectBinance();
+    }
+  }, 5000);
 }
 
 connectBinance();

@@ -20,6 +20,7 @@ dayjs.extend(timezone);
 const { normalizeSymbol, CONTRACTS } = require("../shared/symbolMap");
 const { WHITELIST, setWhitelist } = require("../shared/state");
 const { setBroadcaster } = require("../matching-engine/matchingEngine");
+const { startDailyReset } = require("./dailyReset");   // ✅ new import
 const placeOrderRoute = require("./placeOrder");
 
 // ===== CONFIG =====
@@ -81,7 +82,7 @@ app.use("/place-order", placeOrderRoute);
 
 // ===== API Key Middleware =====
 function requireApiKey(req, res, next) {
-  const queryKey = req.query.key || req.query.token;
+  const queryKey = req.query.key || req.query.token || req.query.api_key;
   const headerKey = req.headers["x-api-key"];
   const token = headerKey || queryKey;
   if (token !== FEED_API_KEY) {
@@ -221,21 +222,29 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
   logEvent("START", `Price Server running on ${PORT}`);
   setBroadcaster((msg) => broadcast(msg));
   await initWhitelist();
+  startDailyReset();   // ✅ start daily reset at startup
 });
 
 // ===== WS Auth =====
 server.on("upgrade", (req, socket, head) => {
-  const query = url.parse(req.url, true).query;
-  const queryKey = query.key || query.token;
+  const parsedUrl = url.parse(req.url, true);
+  const query = parsedUrl.query;
+
+  const queryKey = query.key || query.token || query.api_key;
   const headerKey = req.headers["sec-websocket-protocol"];
   const token = headerKey || queryKey;
+
   if (token !== FEED_API_KEY) {
+    logEvent("AUTH", `WS auth failed from ${req.socket.remoteAddress}`);
     socket.destroy();
     return;
   }
-  if (url.parse(req.url).pathname === "/ws") {
+
+  if (parsedUrl.pathname === "/ws") {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-  } else socket.destroy();
+  } else {
+    socket.destroy();
+  }
 });
 
 wss.on("connection", async (ws) => {
