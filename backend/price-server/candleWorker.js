@@ -1,10 +1,17 @@
-// candleWorker.js — Aggregates ticks into OHLC candles in Redis
+// candleWorker.js — Aggregates ticks into OHLCV candles (Redis + Supabase)
 require("dotenv").config();
 const Redis = require("ioredis");
+const { createClient } = require("@supabase/supabase-js");
 
 const redisUrl = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 const redis = new Redis(redisUrl, { maxRetriesPerRequest: null });
 const redisSub = new Redis(redisUrl, { maxRetriesPerRequest: null });
+
+// ===== Supabase =====
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 const INTERVALS = {
   "1m": 60,
@@ -14,7 +21,8 @@ const INTERVALS = {
 };
 const MAX_CANDLES = 1000;
 
-const liveBuckets = {}; // { key: {time, open, high, low, close} }
+const liveBuckets = {};   // { key: {time, open, high, low, close, volume} }
+let supabaseQueue = [];   // retry buffer
 
 function getBucketTime(tsSec, interval) {
   const bucketSecs = INTERVALS[interval];
@@ -24,7 +32,7 @@ function getBucketTime(tsSec, interval) {
 async function saveCandle(symbol, interval, candle) {
   const key = `candles:${symbol}:${interval}`;
 
-  // ✅ Dedup check: only save if candle changed
+  // ✅ Dedup in Redis
   const last = await redis.lindex(key, -1);
   if (last) {
     try {
@@ -35,12 +43,25 @@ async function saveCandle(symbol, interval, candle) {
     } catch {}
   }
 
+  // Save in Redis
   try {
-    await redis.rpush(key, JSON.stringify(candle)); // append at end
-    await redis.ltrim(key, -MAX_CANDLES, -1); // keep last N
+    await redis.rpush(key, JSON.stringify(candle));
+    await redis.ltrim(key, -MAX_CANDLES, -1);
   } catch (err) {
     console.error("❌ Redis save error", key, err.message);
   }
+
+  // Push to Supabase batch queue
+  supabaseQueue.push({
+    symbol,
+    interval,
+    time: candle.time,
+    open: candle.open,
+    high: candle.high,
+    low: candle.low,
+    close: candle.close,
+    volume: candle.volume || 0,
+  });
 }
 
 function processTick(tick) {
@@ -52,7 +73,7 @@ function processTick(tick) {
     let bucket = liveBuckets[key];
 
     if (!bucket || bucket.time !== bucketTime) {
-      // flush old bucket if exists
+      // flush old bucket
       if (bucket) saveCandle(tick.symbol, interval, bucket);
 
       // start new candle
@@ -62,12 +83,14 @@ function processTick(tick) {
         high: tick.price,
         low: tick.price,
         close: tick.price,
+        volume: tick.size || 1,   // count tick size if available
       };
       liveBuckets[key] = bucket;
     } else {
       bucket.high = Math.max(bucket.high, tick.price);
       bucket.low = Math.min(bucket.low, tick.price);
       bucket.close = tick.price;
+      bucket.volume += tick.size || 1;
     }
   }
 }
@@ -90,12 +113,33 @@ async function preloadLastCandles() {
   }
 }
 
-// Flush all current buckets periodically
+// ===== Flush buckets + batch Supabase =====
 async function flushBuckets() {
   for (const [key, bucket] of Object.entries(liveBuckets)) {
     if (!bucket) continue;
     const [symbol, interval] = key.split(":");
     await saveCandle(symbol, interval, bucket);
+  }
+
+  if (supabaseQueue.length > 0) {
+    const batch = [...supabaseQueue];
+    supabaseQueue = []; // reset buffer
+
+    try {
+      const { error } = await supabase
+        .from("candles")
+        .upsert(batch, { onConflict: "symbol,interval,time" });
+
+      if (error) {
+        console.error("❌ Supabase batch error:", error.message);
+        supabaseQueue.push(...batch); // retry next flush
+      } else {
+        console.log(`📤 Flushed ${batch.length} candles to Supabase`);
+      }
+    } catch (err) {
+      console.error("❌ Supabase save error:", err.message);
+      supabaseQueue.push(...batch);
+    }
   }
 }
 setInterval(flushBuckets, 10_000);
