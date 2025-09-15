@@ -131,6 +131,7 @@ app.get("/candles", requireApiKey, async (req, res) => {
   }
 });
 
+// ===== Metrics =====
 app.get("/metrics", async (req, res) => {
   try {
     res.set("Content-Type", client.register.contentType);
@@ -140,11 +141,16 @@ app.get("/metrics", async (req, res) => {
   }
 });
 
+// ===== Healthcheck =====
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "ok" });
+});
+
 // ===== WS =====
 const wss = new WebSocket.Server({ noServer: true });
 function heartbeat() { this.isAlive = true; }
 
-// ===== Redis Subscriptions (from publisher.js) =====
+// ===== Redis Subscriptions =====
 redisSub.subscribe("price_ticks", () => logEvent("INIT", "Subscribed price_ticks"));
 redisSub.subscribe("orderbook_updates", () => logEvent("INIT", "Subscribed orderbook_updates"));
 

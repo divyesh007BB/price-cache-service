@@ -1,4 +1,4 @@
-// candleWorker.js — Aggregates ticks into OHLCV candles (Redis + Supabase)
+// candleWorker.js — Aggregates ticks into OHLCV candles (Redis live, Supabase final)
 require("dotenv").config();
 const Redis = require("ioredis");
 const { createClient } = require("@supabase/supabase-js");
@@ -29,29 +29,27 @@ function getBucketTime(tsSec, interval) {
   return Math.floor(tsSec / bucketSecs) * bucketSecs;
 }
 
-async function saveCandle(symbol, interval, candle) {
+async function saveToRedis(symbol, interval, candle) {
   const key = `candles:${symbol}:${interval}`;
-
-  // ✅ Dedup in Redis
-  const last = await redis.lindex(key, -1);
-  if (last) {
-    try {
-      const prev = JSON.parse(last);
-      if (prev.time === candle.time && prev.close === candle.close) {
-        return; // skip duplicate
-      }
-    } catch {}
-  }
-
-  // Save in Redis
   try {
+    const last = await redis.lindex(key, -1);
+    if (last) {
+      const prev = JSON.parse(last);
+      if (prev.time === candle.time) {
+        // overwrite latest bucket
+        await redis.lset(key, -1, JSON.stringify(candle));
+        return;
+      }
+    }
+    // push new
     await redis.rpush(key, JSON.stringify(candle));
     await redis.ltrim(key, -MAX_CANDLES, -1);
   } catch (err) {
     console.error("❌ Redis save error", key, err.message);
   }
+}
 
-  // Push to Supabase batch queue
+function enqueueSupabase(symbol, interval, candle) {
   supabaseQueue.push({
     symbol,
     interval,
@@ -73,17 +71,17 @@ function processTick(tick) {
     let bucket = liveBuckets[key];
 
     if (!bucket || bucket.time !== bucketTime) {
-      // flush old bucket
-      if (bucket) saveCandle(tick.symbol, interval, bucket);
+      // finalize old candle → Supabase
+      if (bucket) enqueueSupabase(tick.symbol, interval, bucket);
 
-      // start new candle
+      // start new
       bucket = {
         time: bucketTime,
         open: tick.price,
         high: tick.price,
         low: tick.price,
         close: tick.price,
-        volume: tick.size || 1,   // count tick size if available
+        volume: tick.size || 1,
       };
       liveBuckets[key] = bucket;
     } else {
@@ -92,10 +90,13 @@ function processTick(tick) {
       bucket.close = tick.price;
       bucket.volume += tick.size || 1;
     }
+
+    // always keep Redis live
+    saveToRedis(tick.symbol, interval, bucket);
   }
 }
 
-// ✅ Restore last open candle on restart
+// ✅ Restore last open candle on restart (Redis → memory)
 async function preloadLastCandles() {
   for (const interval of Object.keys(INTERVALS)) {
     const keys = await redis.keys(`candles:*:${interval}`);
@@ -113,36 +114,29 @@ async function preloadLastCandles() {
   }
 }
 
-// ===== Flush buckets + batch Supabase =====
-async function flushBuckets() {
-  for (const [key, bucket] of Object.entries(liveBuckets)) {
-    if (!bucket) continue;
-    const [symbol, interval] = key.split(":");
-    await saveCandle(symbol, interval, bucket);
-  }
+// ===== Supabase batch writer =====
+async function flushSupabase() {
+  if (supabaseQueue.length === 0) return;
+  const batch = [...supabaseQueue];
+  supabaseQueue = [];
 
-  if (supabaseQueue.length > 0) {
-    const batch = [...supabaseQueue];
-    supabaseQueue = []; // reset buffer
+  try {
+    const { error } = await supabase
+      .from("candles")
+      .upsert(batch, { onConflict: "symbol,interval,time" });
 
-    try {
-      const { error } = await supabase
-        .from("candles")
-        .upsert(batch, { onConflict: "symbol,interval,time" });
-
-      if (error) {
-        console.error("❌ Supabase batch error:", error.message);
-        supabaseQueue.push(...batch); // retry next flush
-      } else {
-        console.log(`📤 Flushed ${batch.length} candles to Supabase`);
-      }
-    } catch (err) {
-      console.error("❌ Supabase save error:", err.message);
-      supabaseQueue.push(...batch);
+    if (error) {
+      console.error("❌ Supabase batch error:", error.message);
+      supabaseQueue.push(...batch); // retry later
+    } else {
+      console.log(`📤 Flushed ${batch.length} candles to Supabase`);
     }
+  } catch (err) {
+    console.error("❌ Supabase save error:", err.message);
+    supabaseQueue.push(...batch);
   }
 }
-setInterval(flushBuckets, 10_000);
+setInterval(flushSupabase, 15_000);
 
 // ===== Subscribe to ticks =====
 redisSub.subscribe("price_ticks", (err) => {
@@ -164,8 +158,8 @@ redisSub.on("message", (channel, msg) => {
 
 // ✅ Graceful shutdown
 function gracefulShutdown() {
-  console.log("⚠️ Shutting down, flushing candles...");
-  flushBuckets().then(() => {
+  console.log("⚠️ Shutting down, flushing supabase...");
+  flushSupabase().then(() => {
     redis.quit();
     redisSub.quit();
     process.exit(0);
